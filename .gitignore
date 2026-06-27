@@ -1,0 +1,54 @@
+# Python / venv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# User song library (synced audio + alignments)
+songs/*
+!songs/.gitkeep
+
+# Runtime / pipeline state
+work/
+
+# Optional CLI at repo root (python scripts/run_sync.py without SONG_DIR)
+/hybrid.json
+/hybrid_picks.json
+/lyrics.txt
+/song.json
+
+# Per-song generated artifacts (if any song folder is force-added)
+**/work/
+**/stems/
+**/*.wav
+**/*.csv
+**/*_changes.json
+
+# ML / download caches
+.cache/
+models/
+*.pt
+*.pth
+*.onnx
+
+# Environment / secrets
+.env
+.env.*
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Logs
+*.log
