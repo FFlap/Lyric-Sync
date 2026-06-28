@@ -2,6 +2,7 @@
 """Strip Genius-style section headers and parenthetical ad-libs from pasted lyrics."""
 from __future__ import annotations
 
+import os
 import re
 from typing import TypedDict
 
@@ -16,8 +17,10 @@ class CleanStats(TypedDict):
     stripped_inline: int
 
 
-def parse_lyrics(text: str) -> tuple[list[str], CleanStats]:
+def parse_lyrics(text: str, keep_adlibs: bool | None = None) -> tuple[list[str], CleanStats]:
     """Return sung lyric lines and counts of what was removed."""
+    if keep_adlibs is None:
+        keep_adlibs = os.environ.get("KEEP_ADLIBS") == "1"
     stats: CleanStats = {
         "removed_sections": 0,
         "removed_paren_lines": 0,
@@ -32,12 +35,12 @@ def parse_lyrics(text: str) -> tuple[list[str], CleanStats]:
         if _SECTION.match(line):
             stats["removed_sections"] += 1
             continue
-        if _ONLY_PARENS.match(line):
+        if not keep_adlibs and _ONLY_PARENS.match(line):
             stats["removed_paren_lines"] += 1
             continue
-        if _INLINE_PARENS.search(line):
+        if not keep_adlibs and _INLINE_PARENS.search(line):
             stats["stripped_inline"] += 1
-        cleaned = _INLINE_PARENS.sub("", line).strip()
+        cleaned = line if keep_adlibs else _INLINE_PARENS.sub("", line).strip()
         cleaned = re.sub(r"\s+", " ", cleaned)
         if cleaned:
             lines.append(cleaned)
@@ -51,8 +54,8 @@ def format_lyrics(lines: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def clean_lyrics_text(text: str) -> tuple[str, CleanStats]:
-    lines, stats = parse_lyrics(text)
+def clean_lyrics_text(text: str, keep_adlibs: bool | None = None) -> tuple[str, CleanStats]:
+    lines, stats = parse_lyrics(text, keep_adlibs=keep_adlibs)
     return format_lyrics(lines), stats
 
 

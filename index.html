@@ -219,6 +219,15 @@
       border-color: var(--hover-border);
       box-shadow: 0 0 0 2px var(--active-glow);
     }
+    input[type="search"]::-webkit-search-cancel-button {
+      -webkit-appearance: none;
+      width: 14px;
+      height: 14px;
+      background-color: var(--muted);
+      -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 14 14'%3E%3Cpath d='M2 2l10 10M12 2L2 12' stroke='black' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E") center / contain no-repeat;
+      cursor: pointer;
+    }
+    input[type="search"]::-webkit-search-cancel-button:hover { background-color: var(--subtle); }
     .search { font-size: 14px; }
     .sb-top .search { margin-top: 0; }
     #sbBody {
@@ -468,6 +477,25 @@
     }
     .btn-primary:hover { background: var(--hover-border); }
     .btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+    .input-row { display: flex; gap: 8px; }
+    .input-row input { flex: 1; min-width: 0; }
+    .input-row .btn-primary { width: auto; margin-top: 0; padding-inline: 18px; }
+    .lookup-results { margin-top: 10px; }
+    .lookup-results:empty { display: none; }
+    .lookup-column { min-width: 0; }
+    .lookup-heading { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin: 3px 0 5px; }
+    .lookup-item { width: 100%; display: block; text-align: left; color: var(--subtle); background: var(--bg2); border: 1px solid var(--line); border-radius: 7px; padding: 8px 9px; margin-bottom: 5px; cursor: pointer; overflow: hidden; }
+    .lookup-item:hover, .lookup-item.selected { border-color: var(--active); background: var(--active-chip); }
+    .lookup-item strong, .lookup-item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lookup-item strong { font-size: 12px; color: var(--text); }
+    .lookup-item span { font-size: 10px; color: var(--dim); margin-top: 2px; }
+    .manual-fields { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg2); }
+    .manual-fields summary { padding: 11px 12px; color: var(--subtle); font-size: 13px; font-weight: 600; cursor: pointer; user-select: none; }
+    .manual-fields summary:hover { color: var(--text); }
+    .manual-fields[open] summary { border-bottom: 1px solid var(--line); }
+    .manual-fields-body { padding: 0 12px 12px; }
+    .check-row { display: flex !important; align-items: center; gap: 8px; color: var(--subtle) !important; font-size: 13px !important; text-transform: none !important; letter-spacing: 0 !important; cursor: pointer; }
+    .check-row input { width: 16px; height: 16px; margin: 0; accent-color: var(--active); }
     .progress { height: 4px; background: #22252c; border-radius: 99px; margin-top: 10px; overflow: hidden; }
     .progress > div {
       height: 100%;
@@ -1066,13 +1094,33 @@
         <h2 id="syncModalTitle">New song</h2>
         <button class="icon-btn" id="closeModal" type="button" title="Close">✕</button>
       </div>
-      <p class="modal-note">Paste a YouTube link and lyrics. <code>[Section]</code> headers and <code>(…)</code> ad-libs are stripped automatically.</p>
-      <label for="url">YouTube link</label>
-      <input id="url" type="url" placeholder="https://youtube.com/watch?v=…">
-      <label for="title">Song title (optional)</label>
-      <input id="title" type="text" placeholder="Artist - Song">
-      <label for="lyrics">Lyrics</label>
-      <textarea id="lyrics" placeholder="One line per row…"></textarea>
+      <p class="modal-note">Search by song name, review the matches, then sync. You can still enter everything manually.</p>
+      <label for="songLookup">Find a song</label>
+      <div class="input-row">
+        <input id="songLookup" type="search" placeholder="Artist and song name" autocomplete="off">
+        <button class="btn-primary" id="findSong" type="button">Search</button>
+      </div>
+      <div class="lookup-results" id="lookupResults"></div>
+      <label for="geniusUrl">Genius lyrics link</label>
+      <div class="input-row">
+        <input id="geniusUrl" type="url" placeholder="https://genius.com/artist-song-lyrics">
+        <button class="btn-primary" id="loadGeniusLyrics" type="button">Import</button>
+      </div>
+      <details class="manual-fields" id="manualFields">
+        <summary>Review and edit song details</summary>
+        <div class="manual-fields-body">
+          <label for="url">YouTube link</label>
+          <input id="url" type="url" placeholder="https://youtube.com/watch?v=…">
+          <label for="title">Song title (optional)</label>
+          <input id="title" type="text" placeholder="Artist - Song">
+          <label for="lyrics">Lyrics</label>
+          <textarea id="lyrics" placeholder="One line per row…"></textarea>
+          <label class="check-row" for="keepAdlibs">
+            <input id="keepAdlibs" type="checkbox" checked>
+            Keep parenthesized ad-libs
+          </label>
+        </div>
+      </details>
       <button class="btn-primary" id="go" type="button">Sync lyrics</button>
       <div class="progress"><div id="bar"></div></div>
       <div id="syncLog"></div>
@@ -1658,8 +1706,9 @@
     function openSyncModal() {
       if (syncing) return;
       document.getElementById('err').textContent = '';
+      document.getElementById('manualFields').open = false;
       syncModal.classList.add('open');
-      document.getElementById('url').focus();
+      document.getElementById('songLookup').focus();
     }
 
     function closeSyncModal() {
@@ -1696,6 +1745,82 @@
     function esc(s) {
       return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
     }
+
+    async function loadGeniusLyrics() {
+      const button = document.getElementById('loadGeniusLyrics');
+      const url = document.getElementById('geniusUrl').value.trim();
+      const err = document.getElementById('err');
+      if (!url) { err.textContent = 'Paste a Genius lyrics link'; return; }
+      button.disabled = true;
+      button.textContent = 'Importing…';
+      err.textContent = 'Loading lyrics from Genius…';
+      try {
+        const response = await fetch('/api/genius-lyrics', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Could not load Genius lyrics');
+        document.getElementById('lyrics').value = data.lyrics;
+        err.textContent = '';
+      } catch (error) {
+        err.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Import';
+      }
+    }
+
+    function chooseYouTubeResult(button) {
+      document.querySelectorAll('.lookup-item[data-kind="youtube"]').forEach((el) => el.classList.remove('selected'));
+      button.classList.add('selected');
+      document.getElementById('url').value = decodeURIComponent(button.dataset.url);
+    }
+
+    function renderLookupResults(data) {
+      const target = document.getElementById('lookupResults');
+      const youtube = (data.youtube || []).map((item) =>
+        '<button class="lookup-item" data-kind="youtube" data-url="' + encodeURIComponent(item.url) + '">' +
+          '<strong>' + esc(item.title) + '</strong><span>' + esc(item.channel || 'YouTube') + (item.duration ? ' · ' + fmtTime(item.duration) : '') + '</span></button>'
+      ).join('') || '<div class="modal-note">No YouTube matches</div>';
+      target.innerHTML = '<div class="lookup-column"><div class="lookup-heading">YouTube results</div>' + youtube + '</div>';
+      const firstYouTube = target.querySelector('[data-kind="youtube"]');
+      if (firstYouTube) chooseYouTubeResult(firstYouTube);
+    }
+
+    async function findSong() {
+      const query = document.getElementById('songLookup').value.trim();
+      const button = document.getElementById('findSong');
+      const err = document.getElementById('err');
+      if (!query) { err.textContent = 'Enter an artist and song name'; return; }
+      button.disabled = true;
+      button.textContent = 'Searching…';
+      err.textContent = '';
+      document.getElementById('lookupResults').innerHTML = '';
+      try {
+        const response = await fetch('/api/song-search?q=' + encodeURIComponent(query));
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Search failed');
+        renderLookupResults(data);
+      } catch (error) {
+        err.textContent = error.message;
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Search';
+      }
+    }
+
+    document.getElementById('findSong').onclick = findSong;
+    document.getElementById('loadGeniusLyrics').onclick = loadGeniusLyrics;
+    document.getElementById('songLookup').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); findSong(); }
+    });
+    document.getElementById('lookupResults').addEventListener('click', (e) => {
+      const button = e.target.closest('.lookup-item');
+      if (!button) return;
+      chooseYouTubeResult(button);
+    });
 
     async function loadSongs() {
       const r = await fetch('/api/songs');
@@ -1937,11 +2062,13 @@
           url: document.getElementById('url').value.trim(),
           title: document.getElementById('title').value.trim(),
           lyrics: document.getElementById('lyrics').value,
+          keep_adlibs: document.getElementById('keepAdlibs').checked,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
         err.textContent = data.error || 'Request failed';
+        document.getElementById('manualFields').open = true;
         go.disabled = false;
         go.textContent = 'Sync lyrics';
         syncing = false;
