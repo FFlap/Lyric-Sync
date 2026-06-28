@@ -27,6 +27,16 @@ app = Flask(__name__)
 _job_lock = threading.Lock()
 
 
+def _open_path(path: Path) -> None:
+    """Open a local directory in the platform's file manager."""
+    if os.name == "nt":
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-a", "Finder", str(path)])
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
+
+
 def _write_status(data: dict) -> None:
     WORK.mkdir(parents=True, exist_ok=True)
     STATUS_FILE.write_text(json.dumps(data, indent=2))
@@ -212,6 +222,21 @@ def assets(filename: str):
 @app.route("/api/songs")
 def api_songs():
     return jsonify(list_songs())
+
+
+@app.route("/api/songs/<song_id>/open-folder", methods=["POST"])
+def api_open_song_folder(song_id: str):
+    try:
+        d = song_dir(song_id)
+    except ValueError:
+        return jsonify({"error": "not found"}), 404
+    if not d.is_dir():
+        return jsonify({"error": "not found"}), 404
+    try:
+        _open_path(d)
+    except OSError:
+        return jsonify({"ok": False, "error": "Could not open songs folder"}), 500
+    return jsonify({"ok": True})
 
 
 @app.route("/api/songs/<song_id>", methods=["DELETE"])

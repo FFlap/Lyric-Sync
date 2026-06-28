@@ -279,6 +279,13 @@
       z-index: 60;
       box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
     }
+    #openSongsFolderBtn {
+      position: fixed;
+      top: 14px;
+      right: 102px;
+      z-index: 60;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+    }
     .sb-footer {
       flex-shrink: 0;
       padding: 10px 14px 12px;
@@ -842,6 +849,11 @@
   </style>
 </head>
 <body>
+  <button class="icon-btn" id="openSongsFolderBtn" type="button" title="Open current song folder" aria-label="Open current song folder">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 7.5a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+    </svg>
+  </button>
   <button class="icon-btn" id="lyricSearchBtn" type="button" title="Search lyrics (⌘F)" aria-label="Search lyrics">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
       <circle cx="11" cy="11" r="7"/>
@@ -1574,6 +1586,11 @@
       }
     });
 
+    document.getElementById('openSongsFolderBtn').onclick = async () => {
+      if (!currentId) return;
+      const response = await fetch('/api/songs/' + encodeURIComponent(currentId) + '/open-folder', { method: 'POST' });
+      if (!response.ok) console.error('Could not open songs folder');
+    };
     document.getElementById('lyricSearchBtn').onclick = openSearchModal;
     document.getElementById('closeSearch').onclick = closeSearchModal;
     searchModal.addEventListener('click', (e) => {
