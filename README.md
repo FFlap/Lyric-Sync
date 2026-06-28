@@ -1,3 +1,8 @@
+
+
+
+https://github.com/user-attachments/assets/3b010986-0bb3-44b1-8d67-da3daf2cde1d
+
 # Lyric Sync
 
 Paste a YouTube link and lyrics, and get synchronized word-level timing in a local web player.
