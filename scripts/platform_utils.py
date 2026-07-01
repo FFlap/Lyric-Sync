@@ -51,20 +51,6 @@ def run_python_script(
     run_checked(cmd, env=env or augmented_path_env())
 
 
-def demucs_executable() -> str:
-    bindir = venv_bin_dir()
-    name = "demucs.exe" if os.name == "nt" else "demucs"
-    candidate = bindir / name
-    if candidate.is_file():
-        return str(candidate)
-    import shutil
-
-    found = shutil.which("demucs")
-    if found:
-        return found
-    raise RuntimeError("demucs not on PATH. Run: python scripts/install_deps.py")
-
-
 def ffmpeg_hint() -> str:
     if os.name == "nt":
         return "winget install ffmpeg  (or choco install ffmpeg)"

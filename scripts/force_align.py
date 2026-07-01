@@ -75,7 +75,7 @@ def line_windowed_align(audio, model_a, metadata, lines, base_words, device, pad
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--audio", default="stems/htdemucs/source/vocals.wav")
+    ap.add_argument("--audio", default="work/stems/bs_roformer/vocals.normalized.wav")
     ap.add_argument("--lyrics", default="lyrics.txt")
     ap.add_argument("--out", default="work/align")
     ap.add_argument("--device", default="cpu")

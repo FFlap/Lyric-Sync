@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Demucs → WhisperX → acoustic refine → hybrid blend → song.json (cross-platform)."""
+"""BS-RoFormer → WhisperX → acoustic refine → hybrid blend → song.json."""
 from __future__ import annotations
 
 import os
@@ -44,6 +44,10 @@ def resolve_paths() -> dict[str, Path]:
     }
 
 
+def vocals_path(work: Path) -> Path:
+    return work / "stems" / "bs_roformer" / "vocals.normalized.wav"
+
+
 def main() -> int:
     paths = resolve_paths()
     audio = paths["audio"]
@@ -55,7 +59,7 @@ def main() -> int:
     device = os.environ.get("DEVICE", "cpu")
     title = os.environ.get("TITLE", "Lyric Sync")
 
-    vocals = work / "stems" / "htdemucs" / audio.stem / "vocals.wav"
+    vocals = vocals_path(work)
     env = augmented_path_env()
 
     print(f"==> Output folder: {hybrid.parent}")
@@ -69,11 +73,11 @@ def main() -> int:
 
     (work / "align").mkdir(parents=True, exist_ok=True)
 
-    if os.environ.get("SKIP_DEMUCS") != "1":
-        print("==> Demucs vocal separation")
+    if os.environ.get("SKIP_SEPARATION") != "1":
+        print("==> BS-RoFormer vocal separation and normalization")
         py = project_python()
         proc = subprocess.run(
-            [str(py), str(ROOT / "scripts" / "run_demucs.py"), str(audio), str(work)],
+            [str(py), str(ROOT / "scripts" / "run_bs_roformer.py"), str(audio), str(work)],
             cwd=ROOT,
             env=env,
             check=False,
@@ -81,7 +85,7 @@ def main() -> int:
         if proc.returncode != 0:
             return proc.returncode
     else:
-        print("==> Demucs skipped (SKIP_DEMUCS=1)")
+        print("==> BS-RoFormer skipped (SKIP_SEPARATION=1)")
 
     if not vocals.is_file():
         print(f"Missing vocals stem: {vocals}", file=sys.stderr)

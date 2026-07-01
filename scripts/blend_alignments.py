@@ -39,6 +39,15 @@ def min_duration(word):
     return max(0.028, 0.032 * word_weight(word))
 
 
+def max_short_hold_duration(word):
+    n = norm_alpha(word)
+    if len(n) <= 2:
+        return 0.36
+    if len(n) <= 4:
+        return 0.48
+    return 0.62
+
+
 def expected_duration(word, ac, lw):
     ac_d = float(ac["end"]) - float(ac["start"])
     lw_d = float(lw["end"]) - float(lw["start"])
@@ -90,6 +99,10 @@ def prefer_line_windowed(ac, lw, prev_ac, prev_lw):
     lw_dur = float(lw["end"]) - float(lw["start"])
     ac_score = float(ac.get("score", 0))
     lw_score = float(lw.get("score", 0))
+    lw_later = float(lw["start"]) - float(ac["start"])
+
+    if lw_later > 0.35:
+        return False
 
     if has_plausible_early_lw_short(ac, lw):
         return True
@@ -110,16 +123,28 @@ def prefer_line_windowed(ac, lw, prev_ac, prev_lw):
         if lw_score >= ac_score - 0.2:
             return True
 
-    if lw_score > ac_score + 0.22 and start_delta < 0.35:
+    if lw_score > ac_score + 0.22 and abs(start_delta) < 0.35:
         return True
 
-    if ac_score < 0.42 and lw_score > ac_score + 0.1:
+    if ac_score < 0.42 and lw_score > ac_score + 0.1 and abs(start_delta) <= 0.30:
         return True
 
     # CTC smeared dead air before the sung syllable; LW places the word later.
-    lw_later = float(lw["start"]) - float(ac["start"])
     if lw_later > 0.28 and lw_dur >= 0.06 and ac_dur > max(lw_dur * 2.2, expected_duration(ac["word"], ac, lw) * 1.5):
         if lw_score >= ac_score - 0.25:
+            return True
+
+    # Acoustic often smears a following word onto the previous syllable. If LW
+    # finds a clearly later, higher-confidence onset after a tight acoustic join,
+    # preserve that later attack.
+    if prev_ac is not None:
+        acoustic_gap = float(ac["start"]) - float(prev_ac["end"])
+        if (
+            lw_later > 0.45
+            and acoustic_gap < 0.04
+            and lw_dur >= min_duration(ac["word"])
+            and lw_score >= ac_score + 0.08
+        ):
             return True
 
     # LW line-window often catches phrase onsets earlier than full-song CTC (e.g. chorus after verse).
@@ -288,8 +313,6 @@ def refine_line_openers(words, ac_words, lw_words, lyric_lines, y, sr):
             continue
 
         anchored, ac_anchor = onset_anchors_ac_start(y, sr, ac, lw)
-        if anchored and float(cur["start"]) <= ac_anchor + 0.08:
-            continue
 
         lo = prev_end + 0.08
         hi = lw_start + 0.12
@@ -305,8 +328,12 @@ def refine_line_openers(words, ac_words, lw_words, lyric_lines, y, sr):
         if onset < prev_end + min_duration(prev["word"]) * 0.5:
             continue
 
+        duration = max(
+            min_duration(cur["word"]),
+            float(cur["end"]) - float(cur["start"]),
+        )
         cur["start"] = onset
-        cur["end"] = round(max(onset + min_duration(cur["word"]), float(cur["end"])), 3)
+        cur["end"] = round(onset + duration, 3)
         cur["source"] = cur.get("source", "acoustic") + "+line_open"
     return words
 
@@ -396,6 +423,31 @@ def pick_word(ac, lw, use_lw):
     }
 
 
+def has_line_windowed_early_drift(acoustic, line_windowed):
+    """Detect when LW is globally early enough to make words visibly too fast."""
+    if len(acoustic) < 8 or len(line_windowed) < 8:
+        return False
+
+    deltas = []
+    for ac, lw in zip(acoustic, line_windowed):
+        lw_duration = float(lw["end"]) - float(lw["start"])
+        if lw_duration < 0.045:
+            continue
+        deltas.append(float(lw["start"]) - float(ac["start"]))
+
+    if len(deltas) < 8:
+        return False
+
+    early = sum(1 for delta in deltas if delta < -0.30)
+    late = sum(1 for delta in deltas if delta > 0.30)
+    mean_delta = sum(deltas) / len(deltas)
+    return (
+        early >= max(6, int(len(deltas) * 0.28))
+        and early >= late * 3 + 3
+        and mean_delta < -0.18
+    )
+
+
 def boundary_candidates(prev_start, cur_end, prev, cur, pa, ca, pl, cl):
     raw = [
         pa["end"],
@@ -475,11 +527,53 @@ def optimize_line_boundaries(chunk, ac_chunk, lw_chunk):
                 boundary - prev_start >= min_duration(prev["word"]) - 0.001
                 and cur_end - boundary >= min_duration(cur["word"]) - 0.001
             ):
+                max_prev_duration = max_short_hold_duration(prev["word"])
+                if boundary - prev_start > max_prev_duration:
+                    prev["start"] = round(boundary - max_prev_duration, 3)
                 prev["end"] = boundary
                 cur["start"] = boundary
                 cur["end"] = round(cur_end, 3)
                 prev["source"] = prev.get("source", "acoustic") + "+early_lw_short"
                 cur["source"] = cur.get("source", "acoustic") + "+early_lw_short"
+                continue
+
+        if (
+            "line_windowed" in cur.get("source", "")
+            and float(cl["start"]) - float(ca["start"]) > 0.45
+            and float(cl.get("score", 0)) >= float(ca.get("score", 0)) + 0.08
+        ):
+            boundary = round(float(cl["start"]), 3)
+            if (
+                boundary - prev_start >= min_duration(prev["word"]) - 0.001
+                and cur_end - boundary >= min_duration(cur["word"]) - 0.001
+            ):
+                max_prev_duration = max_short_hold_duration(prev["word"])
+                if boundary - prev_start > max_prev_duration:
+                    prev["start"] = round(boundary - max_prev_duration, 3)
+                prev["end"] = boundary
+                cur["start"] = boundary
+                cur["end"] = round(cur_end, 3)
+                prev["source"] = prev.get("source", "acoustic") + "+later_lw"
+                cur["source"] = cur.get("source", "acoustic") + "+later_lw"
+                continue
+
+        acoustic_gap = float(ca["start"]) - float(pa["end"])
+        acoustic_boundary = (float(pa["end"]) + float(ca["start"])) / 2
+        window_boundary = (float(pl["end"]) + float(cl["start"])) / 2
+        if (
+            "line_windowed" not in prev.get("source", "")
+            and "line_windowed" not in cur.get("source", "")
+            and abs(acoustic_gap) <= 0.06
+            and abs(window_boundary - acoustic_boundary) > 0.30
+        ):
+            boundary = round(acoustic_boundary, 3)
+            if (
+                boundary - prev_start >= min_duration(prev["word"]) - 0.001
+                and cur_end - boundary >= min_duration(cur["word"]) - 0.001
+            ):
+                prev["end"] = boundary
+                cur["start"] = boundary
+                cur["end"] = round(cur_end, 3)
                 continue
 
         best_b, best_s = None, -1e9
@@ -593,6 +687,8 @@ def shift_line_to_early_anchor(chunk, ac_chunk, lw_chunk):
         or swallowed_short_opener
     ):
         return chunk
+    if not has_consistent_line_shift(ac_chunk, lw_chunk, shift):
+        return chunk
 
     for word, acoustic in zip(chunk, ac_chunk):
         word["start"] = round(float(acoustic["start"]) + shift, 3)
@@ -600,6 +696,121 @@ def shift_line_to_early_anchor(chunk, ac_chunk, lw_chunk):
         word["score"] = round(float(acoustic.get("score", 0)), 3)
         word["source"] = "acoustic+line_shift"
     return chunk
+
+
+def conservative_line_anchor(ac_chunk, lw_chunk, previous_lw_chunk, onset_times):
+    """Return an earlier line anchor only when ordering and audio agree."""
+    if len(ac_chunk) < 2 or not lw_chunk or not previous_lw_chunk:
+        return None
+
+    acoustic = ac_chunk[0]
+    windowed = lw_chunk[0]
+    ac_start = float(acoustic["start"])
+    lw_start = float(windowed["start"])
+    shift = lw_start - ac_start
+    if not (-1.15 <= shift <= -0.30):
+        return None
+    if len(norm_alpha(acoustic["word"])) < 4:
+        return None
+
+    tail_deltas = [
+        float(windowed_word["start"]) - float(acoustic_word["start"])
+        for acoustic_word, windowed_word in zip(ac_chunk[1:], lw_chunk[1:])
+        if float(windowed_word["end"]) - float(windowed_word["start"]) >= 0.045
+    ]
+    if len(tail_deltas) < 2:
+        return None
+    if abs(float(np.median(tail_deltas)) - shift) < 0.28:
+        return None
+
+    previous_lw_end = float(previous_lw_chunk[-1]["end"])
+    if lw_start < previous_lw_end - 0.04:
+        return None
+
+    ac_score = float(acoustic.get("score", 0))
+    lw_score = float(windowed.get("score", 0))
+    lw_duration = float(windowed["end"]) - lw_start
+    if lw_score < max(0.45, ac_score - 0.10):
+        return None
+    if lw_duration < min_duration(acoustic["word"]):
+        return None
+    if not any(abs(float(onset) - lw_start) <= 0.18 for onset in onset_times):
+        return None
+    return round(lw_start, 3)
+
+
+def apply_conservative_line_anchor(
+    previous_chunk,
+    previous_acoustic,
+    previous_windowed,
+    current_chunk,
+    anchor,
+):
+    """Translate a line and fit the preceding tail before its new anchor."""
+    if not current_chunk:
+        return
+
+    shift = float(anchor) - float(current_chunk[0]["start"])
+    for word in current_chunk:
+        word["start"] = round(float(word["start"]) + shift, 3)
+        word["end"] = round(float(word["end"]) + shift, 3)
+        word["source"] = word.get("source", "acoustic") + "+line_anchor"
+
+    boundary = round(float(anchor), 3)
+    for index in range(len(previous_chunk) - 1, -1, -1):
+        word = previous_chunk[index]
+        if (
+            float(word["end"]) <= boundary
+            and float(word["start"]) <= boundary - min_duration(word["word"])
+        ):
+            break
+
+        duration = expected_duration(
+            word["word"],
+            previous_acoustic[index],
+            previous_windowed[index],
+        )
+        word["end"] = boundary
+        if float(word["start"]) > boundary - min_duration(word["word"]):
+            word["start"] = round(boundary - duration, 3)
+        word["source"] = word.get("source", "acoustic") + "+line_anchor_fit"
+        boundary = round(float(word["start"]), 3)
+
+        if index:
+            previous = previous_chunk[index - 1]
+            if float(previous["end"]) > boundary:
+                previous["end"] = boundary
+
+
+def apply_supported_line_anchors(line_chunks, y, sr):
+    if y is None or sr is None:
+        return
+
+    for index in range(1, len(line_chunks)):
+        previous_chunk, previous_acoustic, previous_windowed = line_chunks[index - 1]
+        current_chunk, current_acoustic, current_windowed = line_chunks[index]
+        if not previous_chunk or not current_chunk or not current_windowed:
+            continue
+
+        lw_start = float(current_windowed[0]["start"])
+        onset_times = local_onsets(y, sr, lw_start - 0.20, lw_start + 0.20)
+        anchor = conservative_line_anchor(
+            current_acoustic,
+            current_windowed,
+            previous_windowed,
+            onset_times,
+        )
+        if anchor is None:
+            continue
+        if float(previous_chunk[-1]["end"]) - float(anchor) > 1.0:
+            continue
+        apply_conservative_line_anchor(
+            previous_chunk,
+            previous_acoustic,
+            previous_windowed,
+            current_chunk,
+            anchor,
+        )
 
 
 def has_matching_line_opener(ac_chunk, lw_chunk):
@@ -619,6 +830,26 @@ def has_matching_line_opener(ac_chunk, lw_chunk):
         and float(lw.get("score", 0))
         >= max(0.35, float(ac.get("score", 0)) - 0.15)
     )
+
+
+def has_consistent_line_shift(ac_chunk, lw_chunk, shift, tolerance=0.24):
+    """Require several words to agree before moving a whole line timeline."""
+    if len(ac_chunk) < 4 or len(lw_chunk) < 4:
+        return False
+
+    supported = 0
+    usable = 0
+    for ac, lw in zip(ac_chunk, lw_chunk):
+        lw_duration = float(lw["end"]) - float(lw["start"])
+        if lw_duration < 0.045:
+            continue
+        usable += 1
+        delta = float(lw["start"]) - float(ac["start"])
+        if abs(delta - shift) <= tolerance:
+            supported += 1
+
+    needed = max(3, min(5, int(round(usable * 0.45))))
+    return usable >= 4 and supported >= needed
 
 
 def apply_acoustic_line_shift(chunk, ac_chunk, shift, source):
@@ -650,6 +881,8 @@ def propagate_consistent_line_shifts(line_chunks, y=None, sr=None):
                     if onset is not None:
                         anchor = onset
             shift = anchor - float(ac_chunk[0]["start"])
+            if not has_consistent_line_shift(ac_chunk, lw_chunk, shift):
+                continue
             apply_acoustic_line_shift(
                 chunk, ac_chunk, shift, "acoustic+line_shift_pair"
             )
@@ -670,6 +903,7 @@ def propagate_consistent_line_shifts(line_chunks, y=None, sr=None):
             previous_shift is None
             or not (-1.25 <= shift <= -0.35)
             or abs(shift - previous_shift) > 0.35
+            or not has_consistent_line_shift(ac_chunk, lw_chunk, shift)
         ):
             previous_shift = None
             continue
@@ -741,6 +975,12 @@ def apply_lw_stride_gaps(chunk, ac_chunk, lw_chunk):
         prev, cur = chunk[j], chunk[j + 1]
         pa, ca = ac_chunk[j], ac_chunk[j + 1]
         pl, cl = lw_chunk[j], lw_chunk[j + 1]
+
+        if (
+            abs(float(pl["start"]) - float(pa["start"])) > 0.60
+            or abs(float(cl["start"]) - float(ca["start"])) > 0.60
+        ):
+            continue
 
         lw_gap = round(float(cl["start"]) - float(pl["end"]), 3)
         if not (0.04 < lw_gap < 0.20):
@@ -943,6 +1183,8 @@ def refine_absorbed_successors(words, ac_words, lw_words, y, sr):
                 boundary = vowel_short_attack_start(y, sr, t, t + 0.30)
             else:
                 boundary = round(t + 0.02, 3)
+            if boundary - t > 0.16:
+                continue
             prev["end"] = boundary
             cur["start"] = boundary
             prev["source"] = prev.get("source", "acoustic") + "+absorb_split"
@@ -1004,6 +1246,10 @@ def blend(acoustic, line_windowed, lyric_lines, y=None, sr=None):
     picks = []
     pos = 0
     line_chunks = []
+    # Earlier line-window timelines are often adjacent repeats or backing vocals.
+    # Accept them only through the audio-supported anchor path below.
+    suppress_line_windowed = True
+    previous_lw_chunk = None
 
     for line in lyric_lines:
         count = token_count(line)
@@ -1013,6 +1259,14 @@ def blend(acoustic, line_windowed, lyric_lines, y=None, sr=None):
         for j, (ac, lw) in enumerate(zip(ac_chunk, lw_chunk)):
             prev_ac = ac_chunk[j - 1] if j else (acoustic[pos - 1] if pos else None)
             use_lw = prefer_line_windowed(ac, lw, prev_ac, None)
+            if (
+                j == 0
+                and previous_lw_chunk
+                and float(lw["start"]) < float(previous_lw_chunk[-1]["end"]) - 0.04
+            ):
+                use_lw = False
+            if suppress_line_windowed and float(lw["start"]) < float(ac["start"]) - 0.12:
+                use_lw = False
             w = pick_word(ac, lw, use_lw)
             chunk.append(w)
             if use_lw:
@@ -1027,15 +1281,18 @@ def blend(acoustic, line_windowed, lyric_lines, y=None, sr=None):
         line_chunks.append((chunk, ac_chunk, lw_chunk))
         blended.extend(chunk)
         pos += count
+        previous_lw_chunk = lw_chunk
 
     for chunk, ac_chunk, lw_chunk in line_chunks:
         optimize_line_boundaries(chunk, ac_chunk, lw_chunk)
         apply_lw_stride_gaps(chunk, ac_chunk, lw_chunk)
         split_before_next_attack(chunk, ac_chunk, lw_chunk, y, sr)
-        shift_line_to_early_anchor(chunk, ac_chunk, lw_chunk)
+        if not suppress_line_windowed:
+            shift_line_to_early_anchor(chunk, ac_chunk, lw_chunk)
         delay_oversized_vowel_line_opener(chunk, ac_chunk, lw_chunk, y, sr)
 
-    propagate_consistent_line_shifts(line_chunks, y, sr)
+    if not suppress_line_windowed:
+        propagate_consistent_line_shifts(line_chunks, y, sr)
     blended = repair(blended)
     blended = refine_absorbed_successors(blended, acoustic, line_windowed, y, sr)
     blended = repair(blended)
@@ -1046,9 +1303,13 @@ def blend(acoustic, line_windowed, lyric_lines, y=None, sr=None):
     # Reapply validated line anchors after cross-line refinements. Overlapping
     # singers cannot be represented by one globally non-overlapping word stream.
     for chunk, ac_chunk, lw_chunk in line_chunks:
-        shift_line_to_early_anchor(chunk, ac_chunk, lw_chunk)
+        if not suppress_line_windowed:
+            shift_line_to_early_anchor(chunk, ac_chunk, lw_chunk)
         delay_oversized_vowel_line_opener(chunk, ac_chunk, lw_chunk, y, sr)
-    propagate_consistent_line_shifts(line_chunks, y, sr)
+    if not suppress_line_windowed:
+        propagate_consistent_line_shifts(line_chunks, y, sr)
+    else:
+        apply_supported_line_anchors(line_chunks, y, sr)
     for chunk, _, _ in line_chunks:
         repair(chunk)
     return blended, picks
@@ -1059,7 +1320,7 @@ def main():
     ap.add_argument("--acoustic", default="work/acoustic_refined.json")
     ap.add_argument("--line-windowed", default="work/align/whisperx_line_windowed.json")
     ap.add_argument("--lyrics", default="lyrics.txt")
-    ap.add_argument("--audio", default="stems/htdemucs/source/vocals.wav")
+    ap.add_argument("--audio", default="work/stems/bs_roformer/vocals.normalized.wav")
     ap.add_argument("--out", default="work/hybrid.json")
     args = ap.parse_args()
     root = pathlib.Path(__file__).resolve().parents[1]

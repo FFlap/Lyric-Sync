@@ -1960,6 +1960,7 @@
       if (!lines.length) return;
       const force = opts.force === true;
       const { li, wi } = wordIndexAt(t);
+      const line = lines[li];
 
       document.querySelectorAll('.lyric-row').forEach((row, i) => {
         row.classList.remove('past', 'current', 'future');
@@ -1973,7 +1974,8 @@
       document.querySelectorAll('.lyric-row.current .w').forEach((span, i) => {
         span.classList.remove('active', 'done');
         if (i < wi) span.classList.add('done');
-        else if (i === wi) span.classList.add('active');
+        else if (i === wi && t < Number(line.words[wi].end)) span.classList.add('active');
+        else if (i === wi) span.classList.add('done');
       });
 
       if (isDebug()) updateDebugHud(li, wi);
@@ -2018,7 +2020,7 @@
     }
 
     const stepLabels = {
-      download: 'Downloading…', demucs: 'Demucs…', whisperx: 'WhisperX…',
+      download: 'Downloading…', separator: 'BS-RoFormer…', whisperx: 'WhisperX…',
       acoustic: 'Refining…', blend: 'Blend…', song: 'Building…', done: 'Done',
     };
 

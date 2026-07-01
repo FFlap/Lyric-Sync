@@ -246,8 +246,8 @@ def _run_pipeline(url: str, lyrics: str, title: str | None, keep_adlibs: bool = 
             line = line.rstrip()
             if line:
                 _log(status, line)
-                if "Demucs" in line:
-                    status["step"] = "demucs"
+                if "BS-RoFormer" in line:
+                    status["step"] = "separator"
                     step_progress = max(step_progress, 35)
                 elif "WhisperX" in line:
                     status["step"] = "whisperx"

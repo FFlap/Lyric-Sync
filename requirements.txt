@@ -5,7 +5,7 @@ yt-dlp>=2024.1
 # Alignment (CPU)
 torch>=2.0
 torchaudio>=2.0
-demucs>=4.0
+audio-separator==0.44.2
 whisperx>=3.1
 librosa>=0.10
 soundfile>=0.12

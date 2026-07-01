@@ -118,7 +118,7 @@ def write_csv(path, rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--words', default='work/align/whisperx_full.json')
-    ap.add_argument('--audio', default='stems/htdemucs/source/vocals.wav')
+    ap.add_argument('--audio', default='work/stems/bs_roformer/vocals.normalized.wav')
     ap.add_argument('--out', default='work/acoustic_refined.json')
     args = ap.parse_args()
     words = load_words(args.words)

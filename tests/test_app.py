@@ -79,6 +79,14 @@ class OpenSongsFolderTests(unittest.TestCase):
         self.assertIn("encodeURIComponent(currentId) + '/open-folder'", markup)
 
 
+class LyricTimingMarkupTests(unittest.TestCase):
+    def test_active_word_must_not_be_held_past_its_end(self):
+        with app_module.app.test_client() as client:
+            markup = client.get("/").get_data(as_text=True)
+
+        self.assertIn("t < Number(line.words[wi].end)", markup)
+
+
 class SyncLockTests(unittest.TestCase):
     def test_busy_lock_returns_conflict_without_releasing_other_job(self):
         class BusyLock:
