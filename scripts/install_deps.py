@@ -32,7 +32,7 @@ def main() -> int:
         [
             str(py),
             "-c",
-            "import flask, whisperx, audio_separator, librosa, torch; print('ok:', torch.__version__)",
+            "import flask, faster_whisper, audio_separator, librosa, torch, torchaudio; print('ok:', torch.__version__)",
         ],
         cwd=ROOT,
         check=True,

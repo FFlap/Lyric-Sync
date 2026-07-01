@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BS-RoFormer → WhisperX → acoustic refine → hybrid blend → song.json."""
+"""BS-RoFormer → CTC + Whisper-anchored word alignment → song.json."""
 from __future__ import annotations
 
 import os
@@ -91,44 +91,23 @@ def main() -> int:
         print(f"Missing vocals stem: {vocals}", file=sys.stderr)
         return 1
 
-    print("==> WhisperX forced alignment (vocals)")
-    run_python_script(
-        "force_align.py",
-        ["--audio", str(vocals), "--lyrics", str(lyrics), "--out", str(work / "align"), "--device", device],
-        env=env,
-    )
-
-    print("==> Acoustic boundary refinement")
-    run_python_script(
-        "refine_boundaries.py",
-        [
-            "--words",
-            str(work / "align" / "whisperx_full.json"),
-            "--audio",
-            str(vocals),
-            "--out",
-            str(work / "acoustic_refined.json"),
-        ],
-        env=env,
-    )
-
-    print("==> Hybrid blend")
-    run_python_script(
-        "blend_alignments.py",
-        [
-            "--acoustic",
-            str(work / "acoustic_refined.json"),
-            "--line-windowed",
-            str(work / "align" / "whisperx_line_windowed.json"),
-            "--lyrics",
-            str(lyrics),
-            "--audio",
-            str(vocals),
-            "--out",
-            str(hybrid),
-        ],
-        env=env,
-    )
+    print("==> Word alignment (CTC + Whisper anchors)")
+    align_args = [
+        "--audio",
+        str(vocals),
+        "--lyrics",
+        str(lyrics),
+        "--out",
+        str(hybrid),
+        "--device",
+        device,
+        "--debug-dir",
+        str(work / "align"),
+    ]
+    whisper_model = os.environ.get("WHISPER_MODEL", "").strip()
+    if whisper_model:
+        align_args += ["--whisper-model", whisper_model]
+    run_python_script("align_words.py", align_args, env=env)
 
     print("==> Song data")
     run_python_script(

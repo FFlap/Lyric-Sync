@@ -249,13 +249,13 @@ def _run_pipeline(url: str, lyrics: str, title: str | None, keep_adlibs: bool = 
                 if "BS-RoFormer" in line:
                     status["step"] = "separator"
                     step_progress = max(step_progress, 35)
-                elif "WhisperX" in line:
+                elif "Word alignment" in line or "WhisperX" in line:
                     status["step"] = "whisperx"
                     step_progress = max(step_progress, 55)
-                elif "Acoustic" in line:
+                elif "Whisper anchors" in line or "Acoustic" in line:
                     status["step"] = "acoustic"
                     step_progress = max(step_progress, 70)
-                elif "Hybrid" in line:
+                elif "Refine" in line or "Hybrid" in line:
                     status["step"] = "blend"
                     step_progress = max(step_progress, 85)
                 elif "Song data" in line:
