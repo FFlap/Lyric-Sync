@@ -104,6 +104,16 @@ class AudioFeatures:
             onset_envelope=self.onset_env, sr=SR, hop_length=hop, backtrack=True, delta=0.04
         )
         self.onsets = librosa.frames_to_time(frames, sr=SR, hop_length=hop)
+        # spectral novelty (MFCC delta): vowel/articulation changes inside
+        # continuous voicing that leave no amplitude onset (melisma word attacks)
+        import scipy.signal
+
+        mfcc = librosa.feature.mfcc(y=y, sr=SR, n_mfcc=13, hop_length=hop)[1:]
+        nov = np.linalg.norm(np.diff(mfcc, axis=1), axis=0)
+        nov = np.convolve(nov, np.ones(7) / 7, mode="same")
+        nov = (nov - np.min(nov)) / (np.ptp(nov) + 1e-9)
+        peaks, _ = scipy.signal.find_peaks(nov, height=0.30, distance=10)
+        self.novelty = [(float(p * HOP_SEC), float(nov[p])) for p in peaks]
 
     def t2f(self, t: float) -> int:
         return int(np.clip(round(t / HOP_SEC), 0, len(self.rms) - 1))
@@ -288,6 +298,66 @@ def transcribe_slice(model, y: np.ndarray, a: float, b: float) -> list[dict]:
     return words
 
 
+def transcribe_slice_stable(model, y: np.ndarray, a: float, b: float, duration: float) -> list[dict]:
+    """Slice transcription stabilized over boundary offsets.
+
+    Whisper output on hard slices swings with the exact cut points; words that
+    persist across offset runs (same text, start within 0.18s) are trustworthy,
+    the rest are boundary artifacts and get dropped.
+    """
+    def collect(offsets):
+        out = []
+        for da, db in offsets:
+            aa, bb = max(0.0, a + da), min(duration, b + db)
+            if bb - aa < 0.4:
+                continue
+            out.append(transcribe_slice(model, y, aa, bb))
+        return out
+
+    runs = collect(((0.0, 0.0), (-0.35, 0.3), (0.3, -0.35)))
+    if not runs:
+        return []
+    def same_word(w, o) -> bool:
+        if o["norm"] != w["norm"]:
+            return False
+        if abs(o["start"] - w["start"]) <= 0.18:
+            return True
+        # long melisma words: starts wobble with slice bounds, spans overlap
+        inter = min(o["end"], w["end"]) - max(o["start"], w["start"])
+        union = max(o["end"], w["end"]) - min(o["start"], w["start"])
+        return min(o["end"] - o["start"], w["end"] - w["start"]) >= 0.8 and inter / union >= 0.5
+
+    stable = []
+    for w in runs[0]:
+        support = 1
+        starts = [w["start"]]
+        for other in runs[1:]:
+            match = min(
+                (o for o in other if same_word(w, o)),
+                key=lambda o: abs(o["start"] - w["start"]),
+                default=None,
+            )
+            if match is not None:
+                support += 1
+                starts.append(match["start"])
+        if support >= 2:
+            stable.append({**w, "start": round(float(np.median(starts)), 3), "stable": True})
+    return stable
+
+
+def dedupe_hyp(words: list[dict]) -> list[dict]:
+    """Overlapping windows re-hear the same word; keep one per (norm, ~time)."""
+    words = sorted(words, key=lambda w: w["start"])
+    out: list[dict] = []
+    for w in words:
+        dup = any(
+            o["norm"] == w["norm"] and abs(o["start"] - w["start"]) < 0.2 for o in out[-6:]
+        )
+        if not dup:
+            out.append(w)
+    return out
+
+
 def transcribe_windows(y: np.ndarray, feats: AudioFeatures, model_name: str) -> list[dict]:
     """Whisper words with timestamps, transcribing voiced windows independently."""
     intervals = feats.voiced_intervals(0.0, feats.duration, min_len=0.25)
@@ -303,11 +373,23 @@ def transcribe_windows(y: np.ndarray, feats: AudioFeatures, model_name: str) -> 
     words = []
     for a, b in merged:
         words.extend(transcribe_slice(model, y, a, b))
-    words.sort(key=lambda w: w["start"])
-    return words
+    return dedupe_hyp(words)
 
 
 _SIM_CACHE: dict[tuple[str, str], float] = {}
+
+# common sung/written variants that plain edit distance underrates
+_SIM_OVERRIDES = {
+    ("ya", "you"): 0.9,
+    ("ya", "yah"): 0.9,
+    ("cause", "because"): 0.9,
+    ("cause", "cos"): 0.85,
+    ("gonna", "going"): 0.85,
+    ("wanna", "want"): 0.85,
+    ("gotta", "got"): 0.85,
+    ("til", "until"): 0.85,
+    ("em", "them"): 0.85,
+}
 
 
 def word_similarity(a: str, b: str) -> float:
@@ -316,7 +398,8 @@ def word_similarity(a: str, b: str) -> float:
     key = (a, b) if a <= b else (b, a)
     hit = _SIM_CACHE.get(key)
     if hit is None:
-        hit = difflib.SequenceMatcher(None, key[0], key[1]).ratio()
+        override = _SIM_OVERRIDES.get(key) or _SIM_OVERRIDES.get((key[1], key[0]))
+        hit = override or difflib.SequenceMatcher(None, key[0], key[1]).ratio()
         _SIM_CACHE[key] = hit
     return hit
 
@@ -417,6 +500,13 @@ def pick_anchors(
     for k, (ti, hj, sim) in enumerate(pairs):
         if sim < 0.78 or hyp[hj]["p"] < 0.25:
             continue
+        # whisper sometimes merges several sung words into one token
+        # ("gotta" spanning "I got a"); its span then says nothing about
+        # where the matched lyric word starts
+        hyp_dur = hyp[hj]["end"] - hyp[hj]["start"]
+        expected = 0.12 + 0.14 * syllables(tokens[ti]["norm"])
+        if hyp_dur > max(1.0, 3.5 * expected):
+            continue
         # neighbor support: at least one adjacent pair also matches decently
         support = 0
         for kk in (k - 1, k + 1):
@@ -450,12 +540,204 @@ def pick_anchors(
 
 # --------------------------------------------------------------- reconciling
 
+def detect_holds(
+    emission,
+    feats: AudioFeatures,
+    hyp: list[dict],
+) -> list[tuple[float, float]]:
+    """Sustained sung holds: melisma spans where word attacks cannot happen.
+
+    A hold is voiced audio where the CTC posterior is (almost) all blank for
+    a sustained stretch. Note changes inside one melisma briefly dip the
+    blank, so nearby runs are bridged. A single transcript word starting at a
+    hold's head is the hold-owner's own attack; several word starts strictly
+    inside mean the region is articulated singing the CTC merely cannot read,
+    so the hold is vetoed.
+    """
+    blank = emission[:, 0].exp().numpy()
+    smooth = np.convolve(blank, np.ones(9) / 9, mode="same")
+    n = len(smooth)
+
+    runs: list[tuple[float, float]] = []
+    start = None
+    for f in range(n + 1):
+        ok = f < n and smooth[f] >= 0.85 and bool(feats.voiced[feats.t2f(f * FRAME_SEC)])
+        if ok and start is None:
+            start = f * FRAME_SEC
+        elif not ok and start is not None:
+            if f * FRAME_SEC - start >= 0.6:
+                runs.append((start, f * FRAME_SEC))
+            start = None
+
+    def voiced_frac(a: float, b: float) -> float:
+        i, j = feats.t2f(a), feats.t2f(b)
+        if j <= i:
+            return 1.0
+        return float(np.mean(feats.voiced[i:j]))
+
+    # bridge only across voiced re-articulations (note changes inside one
+    # melisma); an unvoiced dip is a real phrase boundary
+    bridged: list[tuple[float, float]] = []
+    for h0, h1 in runs:
+        if bridged and h0 - bridged[-1][1] < 0.5 and voiced_frac(bridged[-1][1], h0) >= 0.7:
+            bridged[-1] = (bridged[-1][0], h1)
+        else:
+            bridged.append((h0, h1))
+
+    # A blank run can span a melisma AND the following words (CTC blind to
+    # both). The transcript tells them apart: a single long word over the
+    # head is the melisma itself, while a covered string of word starts
+    # marks where articulated singing resumes - truncate the hold there.
+    holds = []
+    for h0, h1 in bridged:
+        inner = sorted(w["start"] for w in hyp if h0 + 0.25 < w["start"] < h1 - 0.05)
+        cut = h1
+        for s in inner:
+            tail_cov = sum(
+                max(0.0, min(w["end"], h1) - max(w["start"], s)) for w in hyp
+            ) / max(h1 - s, 0.01)
+            if tail_cov >= 0.5:
+                # whisper word starts lag the true attack over melisma
+                cut = s - 0.25
+                break
+        if cut - h0 >= 0.6:
+            holds.append((h0, cut))
+    return holds
+
+
+def subtract_holds(
+    ivals: list[tuple[float, float]],
+    holds: list[tuple[float, float]],
+    keep_head: float = 0.15,
+) -> list[tuple[float, float]]:
+    """Remove hold interiors from intervals, keeping each hold's attack head."""
+    out = ivals
+    for h0, h1 in holds:
+        cut0, cut1 = h0 + keep_head, h1
+        nxt = []
+        for a, b in out:
+            if cut1 <= a or cut0 >= b:
+                nxt.append((a, b))
+                continue
+            if a < cut0:
+                nxt.append((a, cut0))
+            if cut1 < b:
+                nxt.append((cut1, b))
+        out = nxt
+    return [(a, b) for a, b in out if b - a > 0.02]
+
+
+def in_hold(t: float, holds: list[tuple[float, float]], head: float = 0.15) -> bool:
+    return any(h0 + head < t < h1 for h0, h1 in holds)
+
+
+def hold_chains(
+    holds: list[tuple[float, float]],
+    t0: float,
+    t1: float,
+    feats: AudioFeatures | None = None,
+    max_gap: float = 0.9,
+) -> list[tuple[float, float]]:
+    """Merge nearby holds: re-articulation islets belong to one melisma.
+
+    An unvoiced dip between holds is a breath - a real boundary - so merging
+    only crosses voiced gaps.
+    """
+    sel = [
+        (max(h0, t0), min(h1, t1))
+        for h0, h1 in holds
+        if min(h1, t1) - max(h0, t0) > 0.2
+    ]
+
+    def gap_voiced(a: float, b: float) -> bool:
+        if feats is None:
+            return True
+        i, j = feats.t2f(a), feats.t2f(b)
+        if j <= i:
+            return True
+        return float(np.mean(feats.voiced[i:j])) >= 0.7
+
+    chains: list[tuple[float, float]] = []
+    for h0, h1 in sel:
+        if chains and h0 - chains[-1][1] < max_gap and gap_voiced(chains[-1][1], h0):
+            chains[-1] = (chains[-1][0], h1)
+        else:
+            chains.append((h0, h1))
+    return chains
+
+
+def chain_owner(
+    aligner: "CtcAligner", emission, chain: tuple[float, float], norms: list[str]
+) -> str | None:
+    """The word whose letters keep firing inside a melisma chain owns it.
+
+    A held "o-o-on" keeps spiking 'o' (and finally 'n') across the chain; the
+    words sung before/after leave no letter trace inside. Blank dominates the
+    raw posterior, so letters are renormalized against non-blank mass. The
+    owner norm must clearly beat every other word. Duplicate norms (repeated
+    lines) are fine: ownership is by word text, order resolves which instance.
+    """
+    f0 = max(0, int(chain[0] / FRAME_SEC))
+    f1 = min(emission.shape[0], int(chain[1] / FRAME_SEC))
+    if f1 - f0 < 10:
+        return None
+    probs = emission[f0:f1].exp()
+    letters = probs[:, 1:]
+    rel = letters / (letters.sum(dim=1, keepdim=True) + 1e-9)
+    cov: dict[str, float] = {}
+    for norm in set(norms):
+        ids = [
+            aligner.char_to_id[c.upper()] - 1
+            for c in set(norm)
+            if c.upper() in aligner.char_to_id and aligner.char_to_id[c.upper()] > 0
+        ]
+        if not ids:
+            continue
+        per_frame = rel[:, ids].max(dim=1).values
+        top = per_frame.sort(descending=True).values[: max(3, (f1 - f0) // 2)]
+        cov[norm] = float(top.mean())
+    if not cov:
+        return None
+    ranked = sorted(cov.items(), key=lambda kv: kv[1], reverse=True)
+    if ranked[0][1] < 0.18:
+        return None
+    # vowel-only words (I, a, oh) light up inside any held vowel; they need a
+    # decisive margin before claiming a melisma
+    margin = 1.8 if not any(c not in VOWELS for c in ranked[0][0] if c.isalpha()) else 1.35
+    if len(ranked) > 1 and ranked[0][1] < margin * ranked[1][1]:
+        return None
+    return ranked[0][0]
+
+
+def first_letter_spikes(
+    aligner: "CtcAligner", emission, norm: str, t_lo: float, t_hi: float
+) -> list[float]:
+    """Times where the CTC probability of the word's first letter spikes."""
+    if not norm:
+        return []
+    ch = norm[0].upper()
+    idx = aligner.char_to_id.get(ch)
+    if idx is None:
+        return []
+    import scipy.signal
+
+    f0 = max(0, int(t_lo / FRAME_SEC))
+    f1 = min(emission.shape[0], int(t_hi / FRAME_SEC) + 1)
+    if f1 - f0 < 3:
+        return []
+    probs = emission[f0:f1, idx].exp().numpy()
+    peaks, _ = scipy.signal.find_peaks(probs, height=0.08, distance=5)
+    return [round((f0 + int(p)) * FRAME_SEC, 3) for p in peaks]
+
 def distribute_words(
     tokens: list[dict],
     t0: float,
     t1: float,
     feats: AudioFeatures,
     extra_onsets: list[float] | None = None,
+    letter_spikes: list[list[float]] | None = None,
+    holds: list[tuple[float, float]] | None = None,
+    owned_chains: list[tuple[float, float, str]] | None = None,
 ) -> list[dict]:
     """Place words across voiced audio in [t0, t1].
 
@@ -472,6 +754,12 @@ def distribute_words(
     ivals = feats.voiced_intervals(t0, t1, min_len=0.06)
     if not ivals:
         ivals = [(t0, t1)]
+    if holds:
+        # words are articulated outside sustained holds; a hold extends the
+        # word that starts at its head, so priors spread over articulated time
+        reduced = subtract_holds(ivals, holds)
+        if reduced and sum(b - a for a, b in reduced) >= 0.12 * n:
+            ivals = reduced
     total = sum(b - a for a, b in ivals)
     weights = [syllables(t["norm"]) + 0.35 for t in tokens]
     wsum = sum(weights)
@@ -502,27 +790,103 @@ def distribute_words(
 
     # candidates hugging the far pin belong to the next phrase, not this one
     hi_edge = t1 - 0.25 if t1 - 0.25 > t0 else t1
+    holds = holds or []
+
+    def usable(t: float) -> bool:
+        return t0 - 0.05 <= t <= hi_edge and not in_hold(t, holds)
+
     cands: dict[float, float] = {}
     for t in feats.onsets:
-        if t0 - 0.05 <= t <= hi_edge:
+        if usable(float(t)):
             cands[round(float(t), 3)] = 0.5 * env_at(float(t))
-    for t in extra_onsets or []:
-        if t0 - 0.05 <= t <= hi_edge:
+    # voicing resuming after a breath is a certain word boundary - but only
+    # when actual singing resumes, not flickering instrumental bleed
+    for v0, v1 in feats.voiced_intervals(t0, t1, min_len=0.15):
+        if usable(float(v0)) and v0 > t0 + 0.05:
+            i0 = feats.t2f(v0)
+            i1 = feats.t2f(min(v0 + 0.25, v1))
+            if i1 > i0 and float(np.mean(feats.rms_db[i0:i1])) >= -24.0:
+                key = round(float(v0), 3)
+                cands[key] = max(cands.get(key, 0.0), 0.6)
+    for t, strength in feats.novelty:
+        if usable(float(t)):
             key = round(float(t), 3)
-            cands[key] = max(cands.get(key, 0.0), 0.6)
+            cands[key] = max(cands.get(key, 0.0), 0.42 * strength)
+    stable_ts = []
+    for item in extra_onsets or []:
+        if isinstance(item, tuple):
+            t, is_stable = item
+        else:
+            t, is_stable = item, False
+        if usable(float(t)):
+            key = round(float(t), 3)
+            if is_stable:
+                # stability-confirmed attacks act as pseudo-anchors: low base
+                # salience, strong bonus for the word whose prior is nearest
+                # (otherwise n words chase n junk candidates)
+                stable_ts.append(key)
+                cands[key] = max(cands.get(key, 0.0), 0.2)
+            else:
+                cands[key] = max(cands.get(key, 0.0), 0.45)
+    for words_spikes in letter_spikes or []:
+        for t in words_spikes:
+            if usable(float(t)):
+                cands.setdefault(round(float(t), 3), 0.15)
     for p in priors:
-        cands.setdefault(round(p, 3), 0.0)
+        if not in_hold(p, holds):
+            cands.setdefault(round(p, 3), 0.0)
+    if not cands:
+        for p in priors:
+            cands.setdefault(round(p, 3), 0.0)
     cand_times = sorted(cands)
     sal = [cands[t] for t in cand_times]
     m = len(cand_times)
 
-    # DP: monotone assignment of words to candidate starts
-    POS_W = 0.30  # per-second deviation from prior
+    # per-word bonus: candidate coincides with a CTC spike of the word's first
+    # letter. CTC spikes lag the acoustic attack (vowels by up to ~300ms), so
+    # a candidate slightly before the spike is also a plausible attack.
+    bonus = np.zeros((n, m))
+    for t in stable_ts:
+        k_star = int(np.argmin([abs(p - t) for p in priors]))
+        for j, ct in enumerate(cand_times):
+            if abs(ct - t) <= 0.03:
+                bonus[k_star][j] = max(bonus[k_star][j], 0.75)
+    if letter_spikes:
+        for k in range(min(n, len(letter_spikes))):
+            lag = 0.32 if tokens[k]["norm"][:1] in VOWELS else 0.15
+            for t in letter_spikes[k]:
+                for j, ct in enumerate(cand_times):
+                    if -0.05 <= t - ct <= lag:
+                        bonus[k][j] = max(bonus[k][j], 0.5)
+
+    # melisma ownership: only the owning word (by text) may start at or inside
+    # its chain, and taking the chain head effectively overrides other paths.
+    # The head pull requires a real acoustic event there - a blank run can
+    # begin in a soft tail well before the owner's actual attack.
+    legal = np.ones((n, m), dtype=bool)
+    for c0, c1, owner_norm in owned_chains or []:
+        for j, ct in enumerate(cand_times):
+            if c0 - 0.05 < ct < c1:
+                for k in range(n):
+                    if tokens[k]["norm"] != owner_norm:
+                        legal[k][j] = False
+                    elif ct <= c0 + 0.15 and sal[j] >= 0.15:
+                        bonus[k][j] = max(bonus[k][j], 3.0)
+
+    # DP: monotone assignment of words to candidate starts.
+    # In hold-dominated (melisma) audio the proportional prior is structurally
+    # wrong - the singer speaks the words quickly and stretches one syllable -
+    # so the prior yields to articulation evidence there.
+    hold_cover = sum(
+        max(0.0, min(h1, t1) - max(h0, t0)) for h0, h1 in holds
+    ) / max(t1 - t0, 0.01)
+    POS_W = 0.12 if hold_cover >= 0.4 else 0.26  # per-second deviation from prior
     NEG = -1e9
     dp = np.full((n, m), NEG)
     back = np.zeros((n, m), dtype=np.int32)
     for j in range(m):
-        dp[0][j] = sal[j] - POS_W * abs(cand_times[j] - priors[0])
+        if legal[0][j]:
+            dp[0][j] = sal[j] + bonus[0][j] - POS_W * abs(cand_times[j] - priors[0])
     for k in range(1, n):
         md = min_duration(tokens[k - 1]["norm"])
         best_j, best_v = -1, NEG
@@ -533,9 +897,9 @@ def distribute_words(
                 if dp[k - 1][jj] > best_v:
                     best_v, best_j = dp[k - 1][jj], jj
                 jj += 1
-            if best_j < 0:
+            if best_j < 0 or not legal[k][j]:
                 continue
-            local = sal[j] - POS_W * abs(cand_times[j] - priors[k])
+            local = sal[j] + bonus[k][j] - POS_W * abs(cand_times[j] - priors[k])
             dp[k][j] = best_v + local
             back[k][j] = best_j
     ends = [j for j in range(m) if dp[n - 1][j] > NEG / 2]
@@ -576,6 +940,7 @@ def reconcile(
     emission,
     feats: AudioFeatures,
     hyp: list[dict] | None = None,
+    holds: list[tuple[float, float]] | None = None,
 ) -> list[dict]:
     """Combine base FA with anchors; re-align or distribute drifting segments."""
     n = len(tokens)
@@ -591,7 +956,10 @@ def reconcile(
         ti = a["tok"]
         b = base[ti]
         if b and abs(b["start"] - a["t"]) <= 0.30:
-            out[ti] = {**b, "source": "ctc"}
+            # base start agrees; its end may still be clipped mid-melisma, so
+            # extend toward whisper's word end (bounded - whisper ends smear)
+            end = max(b["end"], min(a["t_end"], b["start"] + 1.2))
+            out[ti] = {**b, "end": round(end, 3), "source": "ctc"}
         else:
             end = a["t_end"]
             if b and a["t"] < b["end"] and 0 < b["end"] - a["t"] < 2.0:
@@ -641,9 +1009,27 @@ def reconcile(
 
         # weak evidence: distribute across voiced audio between pins,
         # snapping to articulations (whisper word onsets included even when
-        # the transcript text didn't match the lyrics)
-        extra = [w["start"] for w in hyp or [] if t_lo - 0.1 <= w["start"] <= t_hi + 0.1]
-        dist = distribute_words([tokens[k] for k in seg], t_lo, t_hi, feats, extra)
+        # the transcript text didn't match the lyrics) and to CTC spikes of
+        # each word's first letter (survive even where full Viterbi failed)
+        in_window = [w for w in hyp or [] if t_lo - 0.1 <= w["start"] <= t_hi + 0.1]
+        stable_in = [w for w in in_window if w.get("stable")]
+        # once stability-checked words exist here, unchecked first-pass words
+        # in the same hard region are more likely junk than signal
+        extra = [(w["start"], True) for w in stable_in] or [
+            (w["start"], False) for w in in_window
+        ]
+        spikes = [
+            first_letter_spikes(aligner, emission, tokens[k]["norm"], t_lo, t_hi) for k in seg
+        ]
+        seg_norms = [tokens[k]["norm"] for k in seg]
+        owned = []
+        for chain in hold_chains(holds or [], t_lo, t_hi, feats):
+            owner_norm = chain_owner(aligner, emission, chain, seg_norms)
+            if owner_norm is not None:
+                owned.append((chain[0], chain[1], owner_norm))
+        dist = distribute_words(
+            [tokens[k] for k in seg], t_lo, t_hi, feats, extra, spikes, holds, owned
+        )
         for k, w in zip(seg, dist):
             out[k] = w
 
@@ -675,17 +1061,25 @@ def weak_segments(tokens: list[dict], words: list[dict]) -> list[tuple[list[int]
     out = []
     for run in runs:
         a, b = float(words[run[0]]["start"]), float(words[run[-1]]["end"])
-        if len(run) >= 4 and b - a >= 2.0:
+        if len(run) >= 2 and b - a >= 1.2:
             out.append((run, a, b))
     return out
 
 
 def merge_anchors(primary: list[dict], extra: list[dict]) -> list[dict]:
-    """Combine anchor sets, keep one per token, enforce monotone times."""
+    """Combine anchor sets, keep one per token, enforce monotone times.
+
+    On similarity ties the extra (tight-slice) anchor wins: focused slices
+    hear dense/doubled vocals more accurately than the long first-pass windows.
+    """
     by_tok: dict[int, dict] = {}
-    for a in primary + extra:
+    for a in primary:
         cur = by_tok.get(a["tok"])
         if cur is None or a["sim"] > cur["sim"]:
+            by_tok[a["tok"]] = a
+    for a in extra:
+        cur = by_tok.get(a["tok"])
+        if cur is None or a["sim"] >= cur["sim"]:
             by_tok[a["tok"]] = a
     merged = [by_tok[t] for t in sorted(by_tok)]
     # longest increasing subsequence over time
@@ -711,6 +1105,31 @@ def merge_anchors(primary: list[dict], extra: list[dict]) -> list[dict]:
 
 def polish(tokens: list[dict], words: list[dict], feats: AudioFeatures) -> list[dict]:
     n = len(words)
+
+    # a word placed in silence before its audible attack (whisper/prior fuzz)
+    # snaps forward to the attack; small pre-roll covers unvoiced consonants
+    for k, w in enumerate(words):
+        if w.get("source") not in ("anchor", "distributed"):
+            continue
+        s = float(w["start"])
+        if feats.voiced[feats.t2f(s + 0.02)]:
+            continue
+        limit = min(s + 0.55, float(words[k + 1]["start"]) if k + 1 < n else feats.duration)
+        a, b = feats.t2f(s), feats.t2f(limit)
+        attack = None
+        for f in range(a, b):
+            if feats.voiced[f]:
+                attack = f * HOP_SEC
+                break
+        if attack is None:
+            continue
+        new_start = round(max(s, attack - 0.07), 3)
+        if new_start > s + 0.05:
+            w["start"] = new_start
+            md = min_duration(tokens[k]["norm"])
+            if float(w["end"]) < new_start + md:
+                w["end"] = round(new_start + md, 3)
+
     # monotonic repair
     for k in range(1, n):
         prev, cur = words[k - 1], words[k]
@@ -728,16 +1147,20 @@ def polish(tokens: list[dict], words: list[dict], feats: AudioFeatures) -> list[
         gap = nxt["start"] - cur["end"]
         if gap <= 0.02:
             continue
+        old_end = float(cur["end"])
         if tokens[k]["line"] != tokens[k + 1]["line"] and gap > 1.5:
             hold_end = feats.last_voiced_before(cur["end"], min(nxt["start"], cur["end"] + 4.0))
             if hold_end > cur["end"]:
+                cur.setdefault("core_end", old_end)
                 cur["end"] = round(min(hold_end + 0.05, nxt["start"] - 0.02), 3)
             continue
         if feats.is_voiced_between(cur["end"], nxt["start"]):
+            cur.setdefault("core_end", old_end)
             cur["end"] = round(nxt["start"] - 0.01, 3)
         else:
             hold_end = feats.last_voiced_before(cur["end"], nxt["start"])
             if hold_end > cur["end"]:
+                cur.setdefault("core_end", old_end)
                 cur["end"] = round(min(hold_end + 0.06, nxt["start"] - 0.01), 3)
 
     for w in words:
@@ -773,15 +1196,122 @@ def find_twin(tokens: list[dict], run: list[int]) -> list[int] | None:
     return None
 
 
+def realign_pickup(
+    tokens: list[dict],
+    words: list[dict],
+    feats: AudioFeatures,
+    aligner: "CtcAligner",
+    emission,
+    run: list[int],
+    prev_end: float,
+) -> bool:
+    """Try to place a paren run as a sung pickup absorbed by the next word.
+
+    Whisper merges pickups into the next word ("twice step" heard as one
+    "Step"), so the next word's anchor swallows the paren audio. Re-aligning
+    [run + following words] against the emissions lets the letter evidence
+    split them; accepted only when the following words land confidently and
+    strictly later than before (i.e., they really had stolen audio).
+    """
+    n = len(words)
+    last = run[-1]
+    follow = [j for j in range(last + 1, min(last + 3, n)) if not tokens[j]["paren"]]
+    if not follow:
+        return False
+    t_lo = prev_end + 0.02
+    t_hi = float(words[follow[-1]]["end"]) + 0.1
+    f0 = int(max(0.0, t_lo) / FRAME_SEC)
+    f1 = int(min(feats.duration, t_hi) / FRAME_SEC)
+    group = run + follow
+    norms = [tokens[k]["norm"] for k in group]
+    if f1 - f0 <= sum(len(w) for w in norms) + len(norms):
+        return False
+    re_al = aligner.align(emission[f0:f1], norms, t_offset=f0 * FRAME_SEC)
+    if not re_al or any(w is None for w in re_al):
+        return False
+    if any(re_al[j + 1]["start"] < re_al[j]["end"] - 0.02 for j in range(len(re_al) - 1)):
+        return False
+    follow_re = re_al[len(run) :]
+    if min(w["score"] for w in follow_re) < 0.15:
+        return False
+    if follow_re[0]["start"] < float(words[follow[0]]["start"]) + 0.25:
+        return False
+    if re_al[0]["start"] < prev_end - 0.05:
+        return False
+
+    # The follow words' re-aligned starts are the trustworthy part; the run's
+    # own spans smear (its letters barely register). The pickup is sung in
+    # the voiced stretch directly before the follow word's attack.
+    v_end = follow_re[0]["start"] - 0.01
+    f_end = feats.t2f(v_end)
+    f_cur = f_end
+    gap = 0
+    while f_cur > feats.t2f(max(prev_end, v_end - 2.0)):
+        if feats.voiced[f_cur]:
+            gap = 0
+        else:
+            gap += 1
+            if gap > 8:
+                break
+        f_cur -= 1
+    v_start = max(prev_end + 0.01, (f_cur + gap) * HOP_SEC)
+    expected = sum(0.12 + 0.1 * syllables(tokens[k]["norm"]) for k in run)
+    if v_end - v_start < 0.4 * expected:
+        return False
+    # a pickup is an interjection after a break; continuous singing from the
+    # previous word into this stretch means the audio is a response between
+    # the words (gap placement), not an absorbed pickup
+    if v_start - prev_end < 0.2 or feats.is_voiced_between(prev_end, v_start, frac=0.6):
+        return False
+    v_start = max(v_start, v_end - 1.6 * expected)
+    weights = [syllables(tokens[k]["norm"]) + 0.3 for k in run]
+    wsum = sum(weights)
+    t = v_start
+    for k, wt in zip(run, weights):
+        dur = (v_end - v_start) * wt / wsum
+        words[k] = {
+            "start": round(t, 3),
+            "end": round(t + dur, 3),
+            "score": 0.15,
+            "source": "ctc_pickup",
+        }
+        t += dur
+    for j, (k, w) in enumerate(zip(follow, follow_re)):
+        end = w["end"]
+        if j + 1 < len(follow_re):
+            nxt_start = follow_re[j + 1]["start"]
+            if feats.is_voiced_between(end, nxt_start):
+                end = nxt_start - 0.01
+        else:
+            end = max(end, float(words[k]["end"]))
+            if k + 1 < n:
+                end = min(end, float(words[k + 1]["start"]) - 0.01)
+            end = max(end, w["start"] + min_duration(tokens[k]["norm"]))
+        words[k] = {**w, "end": round(end, 3), "source": "ctc_pickup"}
+    return True
+
+
 def overlay_echoes(
     tokens: list[dict],
     words: list[dict],
     feats: AudioFeatures,
     base: list[dict] | None = None,
+    aligner: "CtcAligner | None" = None,
+    emission=None,
+    holds: list[tuple[float, float]] | None = None,
 ) -> list[dict]:
     """Echo/backing paren runs without their own audio get overlaid on the main phrase."""
     n = len(words)
     base = base or [None] * n
+    attack_times = np.array(
+        sorted(set(list(feats.onsets) + [t for t, _ in feats.novelty]))
+    )
+
+    def near_attack(t: float, tol: float = 0.22) -> bool:
+        if len(attack_times) == 0:
+            return True
+        return bool(np.min(np.abs(attack_times - t)) <= tol)
+
     for run in paren_runs(tokens):
         first, last = run[0], run[-1]
         w0, w1 = words[first], words[last]
@@ -792,24 +1322,58 @@ def overlay_echoes(
             float(np.mean(good_scores)) >= 0.30
             and span >= 0.5 * expected
             and all(words[k].get("source", "").startswith(("ctc", "anchor")) for k in run)
-        )
+        ) or any(words[k].get("source") == "anchor" for k in run)
         if has_evidence:
+            continue
+
+        # a karaoke-held previous word may have swallowed the run's audio;
+        # its pre-hold core end is the true floor, the tail is reclaimable
+        prev_w = words[first - 1] if first > 0 else None
+        prev_end = float(prev_w.get("core_end", prev_w["end"])) if prev_w else 0.0
+        next_start = words[last + 1]["start"] if last + 1 < n else feats.duration
+
+        def clamp_prev(run_start: float) -> None:
+            if prev_w is None:
+                return
+            if float(prev_w["end"]) > run_start - 0.01:
+                lo = float(prev_w["start"]) + min_duration(tokens[first - 1]["norm"])
+                prev_w["end"] = round(max(lo, run_start - 0.01), 3)
+
+        # A short run may be a sung pickup that the next word's anchor
+        # absorbed ("(TWICE) Step" heard as one "Step"). Letter evidence
+        # arbitrates: accepted only when re-alignment moves the next word
+        # confidently later. Checked before gap placement because stray gap
+        # audio (e.g. the tail of a repeated shout) also attracts the run.
+        if (
+            len(run) <= 3
+            and aligner is not None
+            and emission is not None
+            and realign_pickup(tokens, words, feats, aligner, emission, run, prev_end)
+        ):
+            clamp_prev(float(words[first]["start"]))
             continue
 
         # A real (non-overlapping) echo shows up as voiced audio between the
         # preceding word and the next word. If that audio exists, place the
         # echo there instead of overlaying it on the main phrase.
-        prev_end = words[first - 1]["end"] if first > 0 else 0.0
-        next_start = words[last + 1]["start"] if last + 1 < n else feats.duration
         gap_voiced = sum(
             b - a for a, b in feats.voiced_intervals(prev_end + 0.04, next_start - 0.02)
         )
         if gap_voiced >= 0.6 * expected:
+            # a hold beginning right at the previous word's core end is that
+            # word's own melisma tail; the response starts after it
+            gap_lo = prev_end
+            for h0, h1 in holds or []:
+                if prev_end - 0.1 <= h0 <= prev_end + 0.2 and h1 < next_start - 0.1:
+                    gap_lo = max(gap_lo, h1 + 0.03)
             run_base = [base[k] for k in run]
             base_fits = (
                 all(b is not None for b in run_base)
-                and run_base[0]["start"] >= prev_end - 0.10
+                and run_base[0]["start"] >= gap_lo - 0.10
                 and run_base[-1]["end"] <= next_start + 0.10
+                and run_base[-1]["end"] - run_base[0]["start"] >= 0.4 * expected
+                and near_attack(float(run_base[0]["start"]))
+                and not in_hold(float(run_base[0]["start"]), holds or [])
                 and all(
                     run_base[j]["start"] >= run_base[j - 1]["end"] - 0.05
                     for j in range(1, len(run_base))
@@ -818,36 +1382,82 @@ def overlay_echoes(
             if base_fits:
                 for k, b in zip(run, run_base):
                     words[k] = {**b, "source": "ctc_echo"}
+                clamp_prev(float(run_base[0]["start"]))
             else:
+                spikes = None
+                if aligner is not None and emission is not None:
+                    spikes = [
+                        first_letter_spikes(
+                            aligner, emission, tokens[k]["norm"], gap_lo, next_start
+                        )
+                        for k in run
+                    ]
                 dist = distribute_words(
-                    [tokens[k] for k in run], prev_end + 0.04, next_start - 0.02, feats
+                    [tokens[k] for k in run],
+                    gap_lo + 0.04,
+                    next_start - 0.02,
+                    feats,
+                    None,
+                    spikes,
+                    holds,
                 )
                 for k, w in zip(run, dist):
                     words[k] = {**w, "source": "distributed_echo"}
+                clamp_prev(float(dist[0]["start"]))
             continue
 
         twin = find_twin(tokens, run)
-        if not twin:
+        # a doubled-vocal overlay only makes sense when the echo directly
+        # follows the phrase it repeats; distant twins would teleport it
+        if twin and run[0] - twin[-1] <= 8:
+            main_start = words[twin[0]]["start"]
+            main_end = words[twin[-1]]["end"]
+            # echoes trail the main phrase slightly; keep room before the next word
+            lag = min(0.25, max(0.08, (next_start - main_end) * 0.4))
+            avail_end = max(main_end + lag, min(main_end + lag + 0.2, next_start - 0.02))
+            scale_src = main_end - main_start
+            scale_dst = max(0.3, avail_end - (main_start + lag))
+            ratio = scale_dst / max(scale_src, 0.05)
+            overlay_start = main_start + lag
+            if overlay_start >= prev_end - max(2.0, scale_src * 1.5):
+                for k, m in zip(run, twin):
+                    ms, me = words[m]["start"], words[m]["end"]
+                    words[k] = {
+                        "start": round(overlay_start + (ms - main_start) * ratio, 3),
+                        "end": round(overlay_start + (me - main_start) * ratio, 3),
+                        "score": words[m]["score"],
+                        "source": "echo_overlay",
+                    }
+                # echoes may overlap preceding words by design
+                continue
+
+        # No separate audio and no adjacent twin. Inside continuous singing
+        # the run is a buried backing shout ("over (No)") - show it right
+        # after the previous word. Before a silent break it is an annotation
+        # of the previous word - overlay that word's span.
+        if next_start - prev_end > 0.5 and first > 0:
+            prev_w = words[first - 1]
+            span0, span1 = float(prev_w["start"]), float(prev_w["end"])
+            step = (span1 - span0) / len(run)
+            for j, k in enumerate(run):
+                words[k] = {
+                    "start": round(span0 + j * step, 3),
+                    "end": round(span0 + (j + 1) * step, 3),
+                    "score": 0.05,
+                    "source": "echo_annotation",
+                }
             continue
-        main_start = words[twin[0]]["start"]
-        main_end = words[twin[-1]]["end"]
-        next_start = words[last + 1]["start"] if last + 1 < n else feats.duration
-        # echoes trail the main phrase slightly; keep room before the next word
-        lag = min(0.25, max(0.08, (next_start - main_end) * 0.4))
-        avail_end = max(main_end + lag, min(main_end + lag + 0.2, next_start - 0.02))
-        scale_src = main_end - main_start
-        scale_dst = max(0.3, avail_end - (main_start + lag))
-        ratio = scale_dst / max(scale_src, 0.05)
-        for k, m in zip(run, twin):
-            ms, me = words[m]["start"], words[m]["end"]
+        t = prev_end + 0.02
+        clamp_prev(t)
+        for k in run:
+            dur = max(min_duration(tokens[k]["norm"]), 0.30 * (0.12 + 0.1 * syllables(tokens[k]["norm"])))
             words[k] = {
-                "start": round(main_start + lag + (ms - main_start) * ratio, 3),
-                "end": round(main_start + lag + (me - main_start) * ratio, 3),
-                "score": words[m]["score"],
-                "source": "echo_overlay",
+                "start": round(t, 3),
+                "end": round(t + dur, 3),
+                "score": 0.05,
+                "source": "echo_attach",
             }
-        # keep global monotonicity with the previous non-run word untouched:
-        # echoes may overlap preceding words by design.
+            t += dur
     return words
 
 
@@ -886,7 +1496,8 @@ def align_song(
     print(f"    {len(anchors)} anchors from {len(hyp)} transcript words", flush=True)
 
     print("==> Refine (reconcile + polish)", flush=True)
-    words = reconcile(tokens, base, anchors, aligner, emission, feats, hyp)
+    holds = detect_holds(emission, feats, hyp)
+    words = reconcile(tokens, base, anchors, aligner, emission, feats, hyp, holds)
 
     # Second pass: re-transcribe stubborn regions with tight slices. Long
     # windows garble dense/doubled vocals that a focused slice hears cleanly.
@@ -895,32 +1506,71 @@ def align_song(
         if weak:
             model = get_whisper(whisper_model)
             local_anchors: list[dict] = []
+            stable_words: list[dict] = []
             added = 0
             for run, a, b in weak:
-                extra = transcribe_slice(model, y, max(0.0, a - 0.5), min(feats.duration, b + 0.5))
+                # a crammed run often sits next to a wrongly-stretched anchor
+                # word holding the audio the run really belongs to - include it
+                prev_k, next_k = run[0] - 1, run[-1] + 1
+                if prev_k >= 0 and words[prev_k]["end"] - words[prev_k]["start"] > 1.5:
+                    a = min(a, float(words[prev_k]["start"]))
+                if next_k < len(words) and words[next_k]["end"] - words[next_k]["start"] > 1.5:
+                    b = max(b, float(words[next_k]["end"]))
+                b = min(b, a + 16.0)
+                extra = transcribe_slice_stable(
+                    model, y, max(0.0, a - 0.8), min(feats.duration, b + 1.2), feats.duration
+                )
                 if not extra:
                     continue
                 added += len(extra)
                 hyp.extend(extra)
-                seg_tokens = [tokens[k] for k in run]
-                seg_times = [float(words[k]["start"]) for k in run]
+                stable_words.extend(extra)
+                # include neighboring tokens: their first-pass anchors may be
+                # the misplaced ones that caused this weak segment
+                lo_k = max(0, run[0] - 3)
+                hi_k = min(len(tokens), run[-1] + 4)
+                ctx = list(range(lo_k, hi_k))
+                seg_tokens = [tokens[k] for k in ctx]
+                seg_times = [float(words[k]["start"]) for k in ctx]
                 seg_pairs = match_transcript(seg_tokens, extra, seg_times, pen_scale=4.5)
-                seg_anchors = pick_anchors(seg_tokens, extra, seg_pairs, [base[k] for k in run])
+                seg_anchors = pick_anchors(seg_tokens, extra, seg_pairs, [base[k] for k in ctx])
                 for sa in seg_anchors:
-                    sa["tok"] += run[0]
+                    sa["tok"] += lo_k
                 local_anchors.extend(seg_anchors)
-            if local_anchors:
-                hyp.sort(key=lambda w: w["start"])
+                if debug_dir is not None:
+                    print(
+                        f"      weak {a:.1f}-{b:.1f}s: heard "
+                        + " ".join(f"{w2['norm']}[{w2['start']:.2f}]" for w2 in extra)
+                        + " | anchors "
+                        + " ".join(
+                            f"{tokens[sa['tok']]['word']}@{sa['t']:.2f}" for sa in seg_anchors
+                        ),
+                        flush=True,
+                    )
+            if added:
+                hyp[:] = dedupe_hyp(hyp)
                 anchors = merge_anchors(anchors, local_anchors)
+                holds = detect_holds(emission, feats, hyp)
                 print(
                     f"    second pass: {len(weak)} weak segments, +{added} words, "
                     f"+{len(local_anchors)} local anchors -> {len(anchors)}",
                     flush=True,
                 )
-                words = reconcile(tokens, base, anchors, aligner, emission, feats, hyp)
+                words = reconcile(tokens, base, anchors, aligner, emission, feats, hyp, holds)
 
     words = polish(tokens, words, feats)
-    words = overlay_echoes(tokens, words, feats, base)
+    words = overlay_echoes(tokens, words, feats, base, aligner, emission, holds)
+
+    # echo/pickup moves can strand voiced audio after a word whose hold was
+    # computed against the old layout; re-extend ends only (starts are final)
+    for k in range(len(words) - 1):
+        cur, nxt = words[k], words[k + 1]
+        gap = float(nxt["start"]) - float(cur["end"])
+        if gap <= 0.02:
+            continue
+        hold_end = feats.last_voiced_before(float(cur["end"]), min(float(nxt["start"]), float(cur["end"]) + 2.0))
+        if hold_end > float(cur["end"]):
+            cur["end"] = round(min(hold_end + 0.05, float(nxt["start"]) - 0.01), 3)
 
     by_tok = {tok["i"]: w for tok, w in zip(tokens, words)}
     out = []

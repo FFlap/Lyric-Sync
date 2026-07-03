@@ -122,12 +122,14 @@ class WeakSegmentTests(unittest.TestCase):
         self.assertEqual(run, [1, 2, 3, 4])
         self.assertEqual((a, b), (0.5, 4.5))
 
-    def test_short_runs_ignored(self):
-        tokens = [{"norm": "x"}] * 2
+    def test_single_word_and_short_span_runs_ignored(self):
+        tokens = [{"norm": "x"}] * 3
         words = [
             {"start": 0.0, "end": 3.0, "source": "distributed"},
-            {"start": 3.0, "end": 6.0, "source": "distributed"},
+            {"start": 3.0, "end": 3.5, "source": "ctc"},
+            {"start": 3.5, "end": 4.0, "source": "distributed"},
         ]
+        # lone distributed words and sub-1.2s runs are not weak segments
         self.assertEqual(weak_segments(tokens, words), [])
 
 
