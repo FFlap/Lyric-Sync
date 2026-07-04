@@ -280,6 +280,9 @@ def transcribe_slice(model, y: np.ndarray, a: float, b: float) -> list[dict]:
         word_timestamps=True,
         condition_on_previous_text=False,
         beam_size=5,
+        # no sampling fallback: identical inputs must transcribe identically,
+        # otherwise word placement flaps between runs on hard passages
+        temperature=0.0,
     )
     words = []
     for s in segments:
@@ -314,35 +317,56 @@ def transcribe_slice_stable(model, y: np.ndarray, a: float, b: float, duration: 
             out.append(transcribe_slice(model, y, aa, bb))
         return out
 
-    runs = collect(((0.0, 0.0), (-0.35, 0.3), (0.3, -0.35)))
+    runs = collect(((0.0, 0.0), (-0.35, 0.3), (0.3, -0.35), (-0.8, 0.0), (0.0, 0.7)))
     if not runs:
         return []
+
     def same_word(w, o) -> bool:
         if o["norm"] != w["norm"]:
             return False
         if abs(o["start"] - w["start"]) <= 0.18:
             return True
-        # long melisma words: starts wobble with slice bounds, spans overlap
+        # sustained words: starts wobble with slice bounds, spans overlap;
+        # two heavily-overlapping same-text words are one sung event
         inter = min(o["end"], w["end"]) - max(o["start"], w["start"])
         union = max(o["end"], w["end"]) - min(o["start"], w["start"])
-        return min(o["end"] - o["start"], w["end"] - w["start"]) >= 0.8 and inter / union >= 0.5
+        return min(o["end"] - o["start"], w["end"] - w["start"]) >= 0.5 and inter / union >= 0.5
 
+    # cluster across the union of all framings: a word heard consistently in
+    # any two framings is trustworthy, wherever it first appeared
+    pool = [(ri, w) for ri, r in enumerate(runs) for w in r]
+    pool.sort(key=lambda t: t[1]["start"])
+    used = [False] * len(pool)
     stable = []
-    for w in runs[0]:
-        support = 1
+    for i, (ri, w) in enumerate(pool):
+        if used[i]:
+            continue
+        used[i] = True
         starts = [w["start"]]
-        for other in runs[1:]:
-            match = min(
-                (o for o in other if same_word(w, o)),
-                key=lambda o: abs(o["start"] - w["start"]),
-                default=None,
-            )
-            if match is not None:
-                support += 1
-                starts.append(match["start"])
-        if support >= 2:
+        run_ids = {ri}
+        for j in range(i + 1, len(pool)):
+            rj, o = pool[j]
+            if not used[j] and same_word(w, o):
+                used[j] = True
+                starts.append(o["start"])
+                run_ids.add(rj)
+        if len(run_ids) >= 2:
             stable.append({**w, "start": round(float(np.median(starts)), 3), "stable": True})
-    return stable
+    stable.sort(key=lambda w: w["start"])
+    # same-text stable entries with overlapping spans are one sung event
+    # heard at slightly different offsets - keep a single merged word
+    merged: list[dict] = []
+    for w in stable:
+        if (
+            merged
+            and merged[-1]["norm"] == w["norm"]
+            and w["start"] < merged[-1]["end"] - 0.1
+        ):
+            merged[-1]["end"] = max(merged[-1]["end"], w["end"])
+            merged[-1]["p"] = max(merged[-1]["p"], w["p"])
+        else:
+            merged.append(dict(w))
+    return merged
 
 
 def dedupe_hyp(words: list[dict]) -> list[dict]:
@@ -468,7 +492,10 @@ def match_transcript(
             if bt is not None:
                 dt = abs(hyp[j - 1]["start"] - bt)
                 pen = 0.35 * min(1.0, (dt / pen_scale) ** 2)
-            diag = score[i - 1][j - 1] + (sim - 0.55) - pen
+            # exact matches outrank fuzzy false friends ("two"/"to") even
+            # when the fuzzy one sits closer to the (possibly wrong) base time
+            exact = 0.15 if sim >= 0.999 else 0.0
+            diag = score[i - 1][j - 1] + (sim - 0.55) + exact - pen
             up = score[i - 1][j] + GAP
             left = score[i][j - 1] + GAP
             best = max(diag, up, left)
@@ -499,6 +526,10 @@ def pick_anchors(
     strong = []
     for k, (ti, hj, sim) in enumerate(pairs):
         if sim < 0.78 or hyp[hj]["p"] < 0.25:
+            continue
+        # one edit turns any 2-3 letter word into another ("to"/"two");
+        # short words may only anchor on an exact match
+        if len(tokens[ti]["norm"]) <= 3 and sim < 0.999:
             continue
         # whisper sometimes merges several sung words into one token
         # ("gotta" spanning "I got a"); its span then says nothing about
@@ -738,6 +769,7 @@ def distribute_words(
     letter_spikes: list[list[float]] | None = None,
     holds: list[tuple[float, float]] | None = None,
     owned_chains: list[tuple[float, float, str]] | None = None,
+    next_line: int | None = None,
 ) -> list[dict]:
     """Place words across voiced audio in [t0, t1].
 
@@ -781,6 +813,17 @@ def distribute_words(
     priors = [voiced_time(offsets[k]) for k in range(n)]
     seg_end = voiced_time(total)
 
+    # words that belong to the same lyric line as the next pinned word
+    # cluster near it (a count-in "1" sits with its anchored "2, 3", not in
+    # stray audio seconds earlier)
+    if next_line is not None and t1 - t0 > 1.2:
+        pull = 0.55
+        for k in range(n - 1, -1, -1):
+            if tokens[k].get("line") != next_line:
+                break
+            priors[k] = max(priors[k], t1 - pull)
+            pull += 0.55
+
     # candidate articulation events with salience
     env = feats.onset_env
     env_max = float(np.max(env)) + 1e-9
@@ -789,7 +832,8 @@ def distribute_words(
         return float(env[feats.t2f(t)]) / env_max
 
     # candidates hugging the far pin belong to the next phrase, not this one
-    hi_edge = t1 - 0.25 if t1 - 0.25 > t0 else t1
+    # (kept tight: rapid-fire words can attack ~0.12s before the next pin)
+    hi_edge = t1 - 0.10 if t1 - 0.10 > t0 else t1
     holds = holds or []
 
     def usable(t: float) -> bool:
@@ -800,9 +844,10 @@ def distribute_words(
         if usable(float(t)):
             cands[round(float(t), 3)] = 0.5 * env_at(float(t))
     # voicing resuming after a breath is a certain word boundary - but only
-    # when actual singing resumes, not flickering instrumental bleed
+    # when actual singing resumes, not flickering instrumental bleed, and
+    # not the previous word's own re-voicing just past its capped end
     for v0, v1 in feats.voiced_intervals(t0, t1, min_len=0.15):
-        if usable(float(v0)) and v0 > t0 + 0.05:
+        if usable(float(v0)) and v0 > t0 + 0.25:
             i0 = feats.t2f(v0)
             i1 = feats.t2f(min(v0 + 0.25, v1))
             if i1 > i0 and float(np.mean(feats.rms_db[i0:i1])) >= -24.0:
@@ -853,10 +898,13 @@ def distribute_words(
                 bonus[k_star][j] = max(bonus[k_star][j], 0.75)
     if letter_spikes:
         for k in range(min(n, len(letter_spikes))):
-            lag = 0.32 if tokens[k]["norm"][:1] in VOWELS else 0.15
+            # vowel spikes fire on every sung vowel - only consonant attacks
+            # (plosives/fricatives) are precise enough to bonus
+            if tokens[k]["norm"][:1] in VOWELS:
+                continue
             for t in letter_spikes[k]:
                 for j, ct in enumerate(cand_times):
-                    if -0.05 <= t - ct <= lag:
+                    if -0.05 <= t - ct <= 0.15:
                         bonus[k][j] = max(bonus[k][j], 0.5)
 
     # melisma ownership: only the owning word (by text) may start at or inside
@@ -1007,31 +1055,66 @@ def reconcile(
                 out[k] = {**w, "source": "ctc_window"}
             continue
 
-        # weak evidence: distribute across voiced audio between pins,
-        # snapping to articulations (whisper word onsets included even when
-        # the transcript text didn't match the lyrics) and to CTC spikes of
-        # each word's first letter (survive even where full Viterbi failed)
-        in_window = [w for w in hyp or [] if t_lo - 0.1 <= w["start"] <= t_hi + 0.1]
-        stable_in = [w for w in in_window if w.get("stable")]
-        # once stability-checked words exist here, unchecked first-pass words
-        # in the same hard region are more likely junk than signal
-        extra = [(w["start"], True) for w in stable_in] or [
-            (w["start"], False) for w in in_window
-        ]
-        spikes = [
-            first_letter_spikes(aligner, emission, tokens[k]["norm"], t_lo, t_hi) for k in seg
-        ]
-        seg_norms = [tokens[k]["norm"] for k in seg]
-        owned = []
-        for chain in hold_chains(holds or [], t_lo, t_hi, feats):
-            owner_norm = chain_owner(aligner, emission, chain, seg_norms)
-            if owner_norm is not None:
-                owned.append((chain[0], chain[1], owner_norm))
-        dist = distribute_words(
-            [tokens[k] for k in seg], t_lo, t_hi, feats, extra, spikes, holds, owned
-        )
-        for k, w in zip(seg, dist):
-            out[k] = w
+        # even when the segment as a whole is weak, individually confident
+        # re-aligned words ("got" with its plosive spike) are deterministic
+        # evidence - pin them and distribute only the weak words between
+        pinned: list[int] = []
+        if re_al and len(re_al) == len(seg):
+            for j, w in enumerate(re_al):
+                if w is None or w["score"] < 0.30:
+                    continue
+                # a confident pin must also look like the word: a short word
+                # smeared over a second is Viterbi filling space, not evidence
+                max_dur = max(0.5, 2.5 * (0.12 + 0.14 * syllables(tokens[seg[j]]["norm"])))
+                if w["end"] - w["start"] > max_dur:
+                    continue
+                out[seg[j]] = {**w, "source": "ctc_window"}
+                pinned.append(j)
+
+        def fill(sub: list[int], lo: float, hi: float) -> None:
+            # weak evidence: distribute across voiced audio between pins,
+            # snapping to articulations (whisper word onsets included even
+            # when the transcript text didn't match the lyrics) and to CTC
+            # spikes of each word's first letter
+            in_window = [w for w in hyp or [] if lo - 0.1 <= w["start"] <= hi + 0.1]
+            stable_in = [w for w in in_window if w.get("stable")]
+            # once stability-checked words exist here, unchecked first-pass
+            # words in the same hard region are more likely junk than signal
+            extra = [(w["start"], True) for w in stable_in] or [
+                (w["start"], False) for w in in_window
+            ]
+            spikes = [
+                first_letter_spikes(aligner, emission, tokens[k]["norm"], lo, hi) for k in sub
+            ]
+            sub_norms = [tokens[k]["norm"] for k in sub]
+            owned = []
+            for chain in hold_chains(holds or [], lo, hi, feats):
+                owner_norm = chain_owner(aligner, emission, chain, sub_norms)
+                if owner_norm is not None:
+                    owned.append((chain[0], chain[1], owner_norm))
+            nxt = sub[-1] + 1
+            next_line = tokens[nxt]["line"] if nxt < n else None
+            dist = distribute_words(
+                [tokens[k] for k in sub], lo, hi, feats, extra, spikes, holds, owned, next_line
+            )
+            for k, w in zip(sub, dist):
+                out[k] = w
+
+        if not pinned:
+            fill(seg, t_lo, t_hi)
+        else:
+            # distribute each weak stretch between its surrounding pins
+            j = 0
+            while j < len(seg):
+                if j in pinned:
+                    j += 1
+                    continue
+                j0 = j
+                while j < len(seg) and j not in pinned:
+                    j += 1
+                lo = float(out[seg[j0 - 1]]["end"]) if j0 > 0 else t_lo
+                hi = float(out[seg[j]]["start"]) if j < len(seg) else t_hi
+                fill(seg[j0:j], lo, max(hi, lo + 0.02))
 
     # any remaining gaps (shouldn't happen) -> distribute
     for k in range(n):
@@ -1400,6 +1483,8 @@ def overlay_echoes(
                     None,
                     spikes,
                     holds,
+                    None,
+                    tokens[last + 1]["line"] if last + 1 < n else None,
                 )
                 for k, w in zip(run, dist):
                     words[k] = {**w, "source": "distributed_echo"}
