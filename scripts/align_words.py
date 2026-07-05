@@ -1061,7 +1061,10 @@ def reconcile(
         pinned: list[int] = []
         if re_al and len(re_al) == len(seg):
             for j, w in enumerate(re_al):
-                if w is None or w["score"] < 0.30:
+                # short words match stray letters anywhere ("her" pinning on
+                # the next chorus' "she"), so they need far stronger evidence
+                floor = 0.30 if len(tokens[seg[j]]["norm"]) >= 4 else 0.50
+                if w is None or w["score"] < floor:
                     continue
                 # a confident pin must also look like the word: a short word
                 # smeared over a second is Viterbi filling space, not evidence
@@ -1546,6 +1549,301 @@ def overlay_echoes(
     return words
 
 
+def line_evidence(idxs: list[int], words: list[dict], feats: AudioFeatures) -> float:
+    """How well-supported a line's word timings are."""
+    scores = [float(words[k]["score"]) for k in idxs]
+    src = [
+        1.0 if words[k].get("source", "").startswith(("anchor", "ctc")) else 0.0
+        for k in idxs
+    ]
+    attacks = np.array(sorted(set(list(feats.onsets) + [t for t, _ in feats.novelty])))
+    if len(attacks):
+        atk = [
+            1.0 if float(np.min(np.abs(attacks - float(words[k]["start"])))) <= 0.12 else 0.0
+            for k in idxs
+        ]
+    else:
+        atk = [0.0]
+    return float(np.mean(scores) + 0.3 * np.mean(src) + 0.3 * np.mean(atk))
+
+
+def _line_mfcc(y: np.ndarray, t0: float, t1: float):
+    import librosa
+
+    i0, i1 = int(max(0.0, t0) * SR), int(min(len(y) / SR, t1) * SR)
+    if i1 - i0 < SR // 4:
+        return None
+    m = librosa.feature.mfcc(y=y[i0:i1], sr=SR, n_mfcc=13, hop_length=160)
+    m = m - m.mean(axis=1, keepdims=True)
+    return m
+
+
+def repeat_similarity(y: np.ndarray, a0: float, a1: float, b0: float, b1: float):
+    """(similarity, lag_seconds) between two spans of near-equal duration.
+
+    Correlates MFCC sequences over lags up to +-1.2s; a repeated (copy-paste
+    or re-performed) line correlates strongly at the true offset.
+    """
+    pad = 0.6
+    # the shorter span is the reference: sliding a mis-carved longer span's
+    # center (often melisma-heavy) gives falsely low similarity
+    swapped = (a1 - a0) > (b1 - b0)
+    if swapped:
+        (a0, a1), (b0, b1) = (b0, b1), (a0, a1)
+    ma = _line_mfcc(y, a0 - 0.1, a1 + 0.1)
+    mb = _line_mfcc(y, b0 - pad, b1 + pad)
+    if ma is None or mb is None:
+        return 0.0, 0.0
+    ta, tb = ma.shape[1], mb.shape[1]
+    win = ta
+    if win < 50 or tb < win:
+        return 0.0, 0.0
+    a_ref = ma / (np.linalg.norm(ma) + 1e-9)
+    best, best_lag = 0.0, 0
+    for lag in range(0, tb - win + 1, 2):
+        seg = mb[:, lag : lag + win]
+        c = float(np.sum(a_ref * (seg / (np.linalg.norm(seg) + 1e-9))))
+        if c > best:
+            best, best_lag = c, lag
+    a_off = a0 - 0.1
+    b_off = (b0 - pad) + best_lag * 0.01
+    delta = b_off - a_off
+    return (best, -delta) if swapped else (best, delta)
+
+
+def ownership_consistency(
+    idxs: list[int],
+    words: list[dict],
+    tokens: list[dict],
+    owned_chains: list[tuple[float, float, str]],
+) -> float:
+    """+/- per melisma chain in the line span: does the word covering the
+    chain match the chain's letter-evidence owner?"""
+    a = float(words[idxs[0]]["start"])
+    b = float(words[idxs[-1]]["end"])
+    score = 0.0
+    for c0, c1, owner in owned_chains:
+        if c1 <= a or c0 >= b:
+            continue
+        best_k, best_cov = None, 0.0
+        for k in idxs:
+            cov = min(float(words[k]["end"]), c1) - max(float(words[k]["start"]), c0)
+            if cov > best_cov:
+                best_cov, best_k = cov, k
+        if best_k is None or best_cov < 0.3:
+            continue
+        score += 0.4 if tokens[best_k]["norm"] == owner else -0.4
+    return score
+
+
+def _transfer_pattern(
+    tokens: list[dict],
+    words: list[dict],
+    feats: AudioFeatures,
+    y: np.ndarray,
+    hyp: list[dict] | None,
+    tmpl: list[int],
+    idxs: list[int],
+    label: str = "",
+    min_sim: float = 0.55,
+    max_conflict_frac: float = 0.20,
+    debug: bool = False,
+) -> bool:
+    """Map the template instance's word pattern onto the target instance."""
+    n = len(words)
+    t0, t1 = float(words[tmpl[0]]["start"]), float(words[tmpl[-1]]["end"])
+    b0, b1 = float(words[idxs[0]]["start"]), float(words[idxs[-1]]["end"])
+    sim, lag = repeat_similarity(y, t0, t1, b0, b1)
+    if debug:
+        print(
+            f"      repeat {label}: tmpl@{t0:.1f} -> inst@{b0:.1f} sim={sim:.2f} lag={lag:.2f}",
+            flush=True,
+        )
+    if sim < min_sim:
+        return False
+    dur_t, dur_b = t1 - t0, b1 - b0
+    prev_end = float(words[idxs[0] - 1]["end"]) if idxs[0] > 0 else 0.0
+    next_start = float(words[idxs[-1] + 1]["start"]) if idxs[-1] + 1 < n else feats.duration
+    if abs(dur_b - dur_t) <= 0.15 * max(dur_t, 0.5):
+        # audio repeats verbatim: shift the template pattern
+        new = [(float(words[m]["start"]) + lag, float(words[m]["end"]) + lag) for m in tmpl]
+    else:
+        # same phrase, looser phrasing: rescale relative positions
+        scale = dur_b / max(dur_t, 0.05)
+        new = [
+            (
+                b0 + (float(words[m]["start"]) - t0) * scale,
+                b0 + (float(words[m]["end"]) - t0) * scale,
+            )
+            for m in tmpl
+        ]
+
+    # anchor-backed or transcript-confirmed words are ground truth; if the
+    # template pattern contradicts one, the instances are not sung alike
+    stable_nearby = [
+        w for w in hyp or [] if w.get("stable") and b0 - 0.3 <= w["start"] <= b1 + 0.3
+    ]
+
+    def confirmed(k: int) -> bool:
+        src = words[k].get("source", "")
+        if src == "anchor":
+            return True
+        if src.startswith("ctc") and float(words[k]["score"]) >= 0.30:
+            return True
+        s = float(words[k]["start"])
+        return any(
+            hw["norm"] == tokens[k]["norm"] and abs(s - hw["start"]) <= 0.10
+            for hw in stable_nearby
+        )
+
+    # confirmed words that disagree with the mapping stay put; when many of
+    # them disagree the instances are not sung alike and nothing transfers
+    conflict_set = {
+        j
+        for j, k in enumerate(idxs)
+        if confirmed(k) and abs(new[j][0] - float(words[k]["start"])) > 0.20
+    }
+    if len(conflict_set) > max(1, int(max_conflict_frac * len(idxs))):
+        if debug:
+            print(f"        rejected: {len(conflict_set)} confirmed words disagree", flush=True)
+        return False
+
+    # seams: a karaoke-held previous end is reclaimable; the last word's end
+    # clips to the next word
+    prev_w = words[idxs[0] - 1] if idxs[0] > 0 else None
+    if prev_w is not None and new[0][0] < prev_end:
+        prev_core = float(prev_w["start"]) + min_duration(tokens[idxs[0] - 1]["norm"])
+        if new[0][0] < prev_core:
+            if debug:
+                print(f"        rejected: start {new[0][0]:.2f} inside prev core", flush=True)
+            return False
+        prev_w["end"] = round(new[0][0] - 0.01, 3)
+    if new[-1][0] > next_start - 0.04:
+        if debug:
+            print(f"        rejected: last word start {new[-1][0]:.2f} past next", flush=True)
+        return False
+
+    attacks = np.array(sorted(set(list(feats.onsets) + [t for t, _ in feats.novelty])))
+
+    def attack_supported(t: float) -> bool:
+        return len(attacks) > 0 and float(np.min(np.abs(attacks - t))) <= 0.12
+
+    for j, (k, (s, e)) in enumerate(zip(idxs, new)):
+        # a target word sitting on a real attack does not yield to a template
+        # position that has none - but only if keeping it stays adjacent to
+        # the mapped neighbors (melisma re-articulations also read as attacks)
+        old_s, old_e = float(words[k]["start"]), float(words[k]["end"])
+        if j in conflict_set:
+            continue
+        keep = (
+            abs(s - old_s) > 0.25
+            and attack_supported(old_s)
+            and not attack_supported(s)
+        )
+        if keep and j > 0 and old_s - new[j - 1][1] > 0.6:
+            keep = False
+        if keep and j + 1 < len(new) and new[j + 1][0] - old_e > 0.6:
+            keep = False
+        if keep:
+            continue
+        words[k] = {
+            "start": round(s, 3),
+            "end": round(e, 3),
+            "score": float(words[tmpl[j]]["score"]),
+            "source": "repeat_transfer",
+        }
+    if float(words[idxs[-1]]["end"]) > next_start:
+        words[idxs[-1]]["end"] = round(
+            max(next_start - 0.01, float(words[idxs[-1]]["start"]) + 0.05), 3
+        )
+    for j in range(1, len(idxs)):
+        if float(words[idxs[j]]["start"]) < float(words[idxs[j - 1]]["end"]):
+            words[idxs[j]]["start"] = words[idxs[j - 1]]["end"]
+            if float(words[idxs[j]]["end"]) < float(words[idxs[j]]["start"]) + 0.04:
+                words[idxs[j]]["end"] = round(float(words[idxs[j]]["start"]) + 0.04, 3)
+    return True
+
+
+def harmonize_repeated_lines(
+    tokens: list[dict],
+    words: list[dict],
+    feats: AudioFeatures,
+    y: np.ndarray,
+    hyp: list[dict] | None = None,
+    owned_chains: list[tuple[float, float, str]] | None = None,
+    debug: bool = False,
+) -> list[dict]:
+    """Identical lyric lines sung identically should carry identical timing.
+
+    Line level: a clearly weak instance takes the best-evidenced instance's
+    pattern. Block level: consecutive repeated line runs (whole verse
+    sections) are compared as units, with the earliest occurrence as the
+    reference on near-ties - later verses are re-carvings of the same audio
+    and inherit the first statement's word pattern where unconfirmed.
+    """
+    by_line: dict[int, list[int]] = {}
+    for k, t in enumerate(tokens):
+        by_line.setdefault(t["line"], []).append(k)
+    line_ids = sorted(by_line)
+    keys = {li: tuple(tokens[k]["norm"] for k in by_line[li]) for li in line_ids}
+
+    groups: dict[tuple, list[list[int]]] = {}
+    for li in line_ids:
+        if len(keys[li]) >= 3:
+            groups.setdefault(keys[li], []).append(by_line[li])
+
+    # -- line level: rescue clearly weak instances
+    for key, instances in groups.items():
+        if len(instances) < 2:
+            continue
+        ev = [
+            line_evidence(idxs, words, feats)
+            + ownership_consistency(idxs, words, tokens, owned_chains or [])
+            for idxs in instances
+        ]
+        t_i = int(np.argmax(ev))
+        for i, idxs in enumerate(instances):
+            if i == t_i or ev[i] >= 0.60 or ev[t_i] < ev[i] + 0.10:
+                continue
+            _transfer_pattern(
+                tokens, words, feats, y, hyp, instances[t_i], idxs,
+                label=" ".join(key[:4]), debug=debug,
+            )
+
+    # -- block level: consecutive repeated sections
+    pos = {li: i for i, li in enumerate(line_ids)}
+    done: set[tuple[int, int]] = set()
+    for ai, a_li in enumerate(line_ids):
+        for bi in range(ai + 1, len(line_ids)):
+            b_li = line_ids[bi]
+            if keys[a_li] != keys[b_li] or len(keys[a_li]) < 2:
+                continue
+            length = 0
+            while (
+                ai + length < len(line_ids)
+                and bi + length < len(line_ids)
+                and ai + length < bi
+                and keys[line_ids[ai + length]] == keys[line_ids[bi + length]]
+            ):
+                length += 1
+            if length < 2 or (ai, bi) in done:
+                continue
+            for off in range(length):
+                done.add((ai + off, bi + off))
+            tmpl_idxs = [k for off in range(length) for k in by_line[line_ids[ai + off]]]
+            tgt_idxs = [k for off in range(length) for k in by_line[line_ids[bi + off]]]
+            if len(tmpl_idxs) != len(tgt_idxs) or len(tmpl_idxs) < 6:
+                continue
+            # blocks bulldoze whole sections: demand near-verbatim audio
+            # and near-total confirmed agreement
+            _transfer_pattern(
+                tokens, words, feats, y, hyp, tmpl_idxs, tgt_idxs,
+                label=f"block {' '.join(keys[a_li][:3])}.. x{length}",
+                min_sim=0.68, max_conflict_frac=0.08, debug=debug,
+            )
+    return words
+
+
 # ----------------------------------------------------------------------- main
 
 def align_song(
@@ -1656,6 +1954,24 @@ def align_song(
         hold_end = feats.last_voiced_before(float(cur["end"]), min(float(nxt["start"]), float(cur["end"]) + 2.0))
         if hold_end > float(cur["end"]):
             cur["end"] = round(min(hold_end + 0.05, float(nxt["start"]) - 0.01), 3)
+
+    owned_all: list[tuple[float, float, str]] = []
+    for chain in hold_chains(holds or [], 0.0, feats.duration, feats):
+        near = sorted(
+            {
+                tokens[k]["norm"]
+                for k in range(len(tokens))
+                if float(words[k]["start"]) < chain[1] + 0.8
+                and float(words[k]["end"]) > chain[0] - 0.8
+            }
+        )
+        if near:
+            owner = chain_owner(aligner, emission, chain, near)
+            if owner is not None:
+                owned_all.append((chain[0], chain[1], owner))
+    words = harmonize_repeated_lines(
+        tokens, words, feats, y, hyp, owned_all, debug=debug_dir is not None
+    )
 
     by_tok = {tok["i"]: w for tok, w in zip(tokens, words)}
     out = []
