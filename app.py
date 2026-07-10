@@ -358,6 +358,40 @@ def api_song_audio(song_id: str):
     return send_from_directory(d, "audio.wav")
 
 
+@app.route("/api/songs/<song_id>/timings", methods=["PUT"])
+def api_save_timings(song_id: str):
+    try:
+        d = song_dir(song_id)
+    except ValueError:
+        return jsonify({"error": "not found"}), 404
+    if not d.is_dir():
+        return jsonify({"error": "not found"}), 404
+    payload = request.get_json(force=True, silent=True) or {}
+    words = payload.get("words")
+    if not isinstance(words, list) or not words:
+        return jsonify({"error": "words must be a non-empty list"}), 400
+    cleaned = []
+    for w in words:
+        if not isinstance(w, dict) or not isinstance(w.get("word"), str):
+            return jsonify({"error": "each word needs a word string"}), 400
+        try:
+            start = round(float(w["start"]), 3)
+            end = round(float(w["end"]), 3)
+        except (KeyError, TypeError, ValueError):
+            return jsonify({"error": "each word needs numeric start/end"}), 400
+        if start < 0 or end < start:
+            return jsonify({"error": f"bad time range for {w['word']!r}"}), 400
+        cleaned.append({**w, "start": start, "end": end})
+    lyrics_file = d / "lyrics.txt"
+    if not lyrics_file.exists():
+        return jsonify({"error": "lyrics.txt missing"}), 500
+    meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {"id": song_id}
+    lyric_lines, _ = parse_lyrics(lyrics_file.read_text(), keep_adlibs=bool(meta.get("keep_adlibs")))
+    (d / "hybrid.json").write_text(json.dumps(cleaned, indent=2))
+    data = export_song_json(lyric_lines, cleaned, d / "song.json", meta)
+    return jsonify({"ok": True, "words": data["words"], "lines": data["lines"]})
+
+
 @app.route("/api/status")
 def api_status():
     return jsonify(_read_status())

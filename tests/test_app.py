@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import sys
 import tempfile
 import unittest
@@ -85,6 +86,51 @@ class LyricTimingMarkupTests(unittest.TestCase):
             markup = client.get("/").get_data(as_text=True)
 
         self.assertIn("t < Number(line.words[wi].end)", markup)
+
+
+class SaveTimingsTests(unittest.TestCase):
+    def test_save_timings_rejects_parent_directory(self):
+        with app_module.app.test_client() as client:
+            response = client.put("/api/songs/%2E%2E/timings", json={"words": []})
+        self.assertEqual(response.status_code, 404)
+
+    def test_save_timings_rejects_bad_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "song"
+            d.mkdir()
+            words = [{"i": 1, "word": "Hello", "start": 2.0, "end": 1.0}]
+            with (
+                patch.object(app_module, "song_dir", return_value=d),
+                app_module.app.test_client() as client,
+            ):
+                response = client.put("/api/songs/song/timings", json={"words": words})
+        self.assertEqual(response.status_code, 400)
+
+    def test_save_timings_writes_hybrid_and_song_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "song"
+            d.mkdir()
+            (d / "lyrics.txt").write_text("Hello world\n")
+            (d / "meta.json").write_text(json.dumps({"id": "song", "title": "Song"}))
+            words = [
+                {"i": 1, "word": "Hello", "start": 1.0, "end": 1.5, "source": "manual", "score": 1},
+                {"i": 2, "word": "world", "start": 1.6, "end": 2.2004, "source": "ctc", "score": 0.9},
+            ]
+            with (
+                patch.object(app_module, "song_dir", return_value=d),
+                app_module.app.test_client() as client,
+            ):
+                response = client.put("/api/songs/song/timings", json={"words": words})
+
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertTrue(data["ok"])
+            hybrid = json.loads((d / "hybrid.json").read_text())
+            self.assertEqual(hybrid[1]["end"], 2.2)
+            song = json.loads((d / "song.json").read_text())
+            self.assertEqual(song["lines"][0]["text"], "Hello world")
+            self.assertEqual(song["lines"][0]["start"], 1.0)
+            self.assertEqual(data["lines"][0]["words"][0]["source"], "manual")
 
 
 class SyncLockTests(unittest.TestCase):

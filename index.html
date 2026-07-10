@@ -874,6 +874,146 @@
       display: block;
     }
     #audio { display: none; }
+
+    #timelinePanel {
+      flex-shrink: 0;
+      height: 192px;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg2);
+      border-top: 1px solid var(--line);
+      z-index: 20;
+    }
+    #timelinePanel[hidden] { display: none; }
+    body.timeline-open.player-loaded #playerBar { bottom: 212px; }
+    .tl-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 6px 12px;
+      min-height: 40px;
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .tl-name { font-weight: 700; color: var(--text); white-space: nowrap; }
+    .tl-clock {
+      font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+      color: var(--dim);
+      min-width: 58px;
+      font-variant-numeric: tabular-nums;
+    }
+    .tl-sel { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .tl-sel[hidden] { display: none; }
+    .tl-sel-word {
+      color: var(--active);
+      font-weight: 600;
+      max-width: 130px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .tl-sel input {
+      width: 74px;
+      padding: 4px 6px;
+      font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+      border-radius: 6px;
+    }
+    .tl-sel input::-webkit-outer-spin-button,
+    .tl-sel input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .tl-hint {
+      color: var(--dim);
+      font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .tl-hint[hidden] { display: none; }
+    .tl-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .tl-status { font-size: 11px; color: var(--muted); margin-right: 4px; }
+    .tl-btn {
+      font: inherit;
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .tl-btn:hover:not(:disabled) { border-color: var(--hover-border); background: var(--hover-bg); }
+    .tl-btn:disabled { opacity: 0.4; cursor: default; }
+    .tl-save { background: var(--active); border-color: var(--active); color: var(--bg); font-weight: 700; }
+    .tl-save:hover:not(:disabled) { filter: brightness(1.06); background: var(--active); border-color: var(--active); }
+    .tl-body { position: relative; flex: 1; min-height: 0; }
+    #tlWave { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .tl-scroll { position: absolute; inset: 0; overflow-x: auto; overflow-y: hidden; }
+    .tl-track { position: relative; height: 100%; min-width: 100%; }
+    #tlWords { position: absolute; inset: 0; }
+    .tl-playhead {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      margin-left: -1px;
+      background: var(--active);
+      z-index: 4;
+      pointer-events: none;
+    }
+    .tl-word {
+      position: absolute;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      border: 1px solid color-mix(in srgb, var(--active) 40%, var(--line));
+      background: color-mix(in srgb, var(--active) 15%, rgba(27, 29, 34, 0.82));
+      border-radius: 6px;
+      cursor: grab;
+      user-select: none;
+      -webkit-user-select: none;
+      overflow: hidden;
+      touch-action: none;
+      z-index: 2;
+    }
+    .tl-word:hover {
+      border-color: var(--active-muted);
+      background: color-mix(in srgb, var(--active) 24%, rgba(27, 29, 34, 0.85));
+    }
+    .tl-word.sel {
+      border-color: var(--active);
+      background: color-mix(in srgb, var(--active) 32%, rgba(27, 29, 34, 0.9));
+      box-shadow: 0 0 0 1px var(--active);
+      z-index: 3;
+    }
+    .tl-word.now .tl-label { color: var(--active); }
+    .tl-word.dirty::before {
+      content: '';
+      position: absolute;
+      top: 3px;
+      right: 3px;
+      width: 5px;
+      height: 5px;
+      border-radius: 50%;
+      background: #ffd08a;
+    }
+    .tl-label {
+      flex: 1;
+      min-width: 0;
+      padding: 0 2px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+      pointer-events: none;
+    }
+    .tl-h { flex-shrink: 0; width: 7px; align-self: stretch; cursor: ew-resize; }
+    .tl-h:hover { background: color-mix(in srgb, var(--active) 40%, transparent); }
   </style>
 </head>
 <body>
@@ -1016,6 +1156,36 @@
           </div>
         </div>
         <audio id="audio" preload="metadata"></audio>
+      </div>
+      <div id="timelinePanel" hidden>
+        <div class="tl-toolbar">
+          <span class="tl-name">Timing editor</span>
+          <span class="tl-clock" id="tlClock">0.000s</span>
+          <div class="tl-sel" id="tlSelBox" hidden>
+            <span class="tl-sel-word" id="tlSelWord"></span>
+            <input type="number" id="tlSelStart" step="0.01" min="0" title="Word start (seconds)">
+            <span>–</span>
+            <input type="number" id="tlSelEnd" step="0.01" min="0" title="Word end (seconds)">
+          </div>
+          <span class="tl-hint" id="tlHint">Drag words · edges resize · ⌘click multi · ⇧click range · ←/→ nudge · ⌘S save</span>
+          <div class="tl-actions">
+            <span class="tl-status" id="tlStatus"></span>
+            <button class="tl-btn" id="tlUndoBtn" type="button" title="Undo (⌘Z)" disabled>Undo</button>
+            <button class="tl-btn" id="tlZoomOut" type="button" title="Zoom out">−</button>
+            <button class="tl-btn" id="tlZoomIn" type="button" title="Zoom in">+</button>
+            <button class="tl-btn" id="tlFitBtn" type="button" title="Fit whole song">Fit</button>
+            <button class="tl-btn tl-save" id="tlSaveBtn" type="button" title="Save timings (⌘S)" disabled>Save</button>
+          </div>
+        </div>
+        <div class="tl-body" id="tlBody">
+          <canvas id="tlWave"></canvas>
+          <div class="tl-scroll" id="tlScroll">
+            <div class="tl-track" id="tlTrack">
+              <div id="tlWords"></div>
+              <div class="tl-playhead" id="tlPlayhead"></div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1208,6 +1378,7 @@
       if (linesMode === 'compact') document.body.classList.add('lines-compact');
       if (debugOn) document.body.classList.add('debug-mode');
       document.getElementById('debugHud').hidden = !debugOn;
+      refreshTimelineVisibility();
       document.documentElement.style.setProperty('--active', prefs.accent || '#9fb7ff');
       const dim = DIM_OPACITY[prefs.dim || 'md'];
       document.documentElement.style.setProperty('--lyric-past', String(dim.past));
@@ -1251,6 +1422,582 @@
         row.classList.toggle('compact-next', compact && i === li + 1);
       });
     }
+
+    // ---------- Debug timing editor ----------
+    const tlPanel = document.getElementById('timelinePanel');
+    const tlBody = document.getElementById('tlBody');
+    const tlScroll = document.getElementById('tlScroll');
+    const tlTrack = document.getElementById('tlTrack');
+    const tlWords = document.getElementById('tlWords');
+    const tlPlayhead = document.getElementById('tlPlayhead');
+    const tlCanvas = document.getElementById('tlWave');
+    const tlCtx = tlCanvas.getContext('2d');
+    const tlClock = document.getElementById('tlClock');
+    const tlSelBox = document.getElementById('tlSelBox');
+    const tlSelWordEl = document.getElementById('tlSelWord');
+    const tlSelStart = document.getElementById('tlSelStart');
+    const tlSelEnd = document.getElementById('tlSelEnd');
+    const tlHint = document.getElementById('tlHint');
+    const tlStatus = document.getElementById('tlStatus');
+    const tlSaveBtn = document.getElementById('tlSaveBtn');
+    const tlUndoBtn = document.getElementById('tlUndoBtn');
+
+    const TL_MIN_DUR = 0.03;
+    const TL_RULER_H = 16;
+    const TL_LANES = [26, 72];
+    const TL_PEAKS_PER_SEC = 80;
+
+    let tlSong = null;
+    let tlPps = 60;
+    let tlDur = 0;
+    let tlPeaks = null;
+    let tlPeaksSong = null;
+    let tlSel = null;
+    let tlSelKeys = new Set();
+    let tlDirty = new Set();
+    let tlUndoStack = [];
+    let tlDrag = null;
+    let tlScrub = false;
+    let tlUserScrollUntil = 0;
+    let tlProgScroll = -1;
+    let tlLastPt = 0;
+    let tlActiveKey = '';
+    let tlActiveBlock = null;
+    let tlStatusTimer = null;
+    let flatByI = new Map();
+
+    function tlIsOpen() { return !tlPanel.hidden; }
+    function round3(v) { return Math.round(v * 1000) / 1000; }
+    function tlWordAt(li, wi) { return lines[li] && lines[li].words[wi]; }
+    function tlBlockFor(li, wi) {
+      return tlWords.querySelector('.tl-word[data-li="' + li + '"][data-wi="' + wi + '"]');
+    }
+    function tlKey(li, wi) { return li + ':' + wi; }
+    function tlSelList() {
+      return [...tlSelKeys].map((k) => {
+        const [li, wi] = k.split(':').map(Number);
+        return { li, wi };
+      }).filter(({ li, wi }) => tlWordAt(li, wi));
+    }
+
+    function tlSongDur() {
+      const d = audio.duration;
+      if (isFinite(d) && d > 0) return d;
+      let last = 0;
+      lines.forEach((l) => l.words.forEach((w) => { last = Math.max(last, w.end || w.start || 0); }));
+      return last + 3;
+    }
+
+    function refreshTimelineVisibility() {
+      const on = isDebug() && !!currentId && lines.length > 0;
+      tlPanel.hidden = !on;
+      document.body.classList.toggle('timeline-open', on);
+      if (!on) return;
+      if (tlSong !== currentId) {
+        tlSong = currentId;
+        tlSel = null;
+        deselectTlWord();
+        tlDirty.clear();
+        tlUndoStack = [];
+        tlDur = tlSongDur();
+        buildTimelineBlocks();
+        tlFit();
+        loadWaveform(currentId);
+        updateTlToolbar();
+        setTlStatus('');
+      }
+    }
+
+    function buildTimelineBlocks() {
+      flatByI = new Map(words.map((w) => [w.i, w]));
+      let html = '';
+      let n = 0;
+      lines.forEach((line, li) => {
+        line.words.forEach((w, wi) => {
+          const lane = n++ % 2;
+          html += '<div class="tl-word" data-li="' + li + '" data-wi="' + wi + '" style="top:' + TL_LANES[lane] + 'px" title="' + esc(w.word) + '">' +
+            '<span class="tl-h tl-h-l"></span><span class="tl-label">' + esc(w.word) + '</span><span class="tl-h tl-h-r"></span></div>';
+        });
+      });
+      tlWords.innerHTML = html;
+      tlActiveKey = '';
+      tlActiveBlock = null;
+      tlRepositionAll();
+      applySelClass();
+    }
+
+    function positionBlock(el) {
+      const w = tlWordAt(+el.dataset.li, +el.dataset.wi);
+      if (!w) return;
+      const end = w.end != null ? w.end : w.start;
+      el.style.left = (w.start * tlPps) + 'px';
+      el.style.width = Math.max(8, (end - w.start) * tlPps) + 'px';
+    }
+
+    function tlRepositionAll() {
+      tlTrack.style.width = Math.ceil(tlDur * tlPps) + 'px';
+      tlWords.querySelectorAll('.tl-word').forEach(positionBlock);
+    }
+
+    function tlSetScroll(x) {
+      tlScroll.scrollLeft = x;
+      tlProgScroll = tlScroll.scrollLeft;
+    }
+
+    function tlSetPps(pps, anchorX) {
+      pps = Math.max(2, Math.min(600, pps));
+      if (pps === tlPps) return;
+      const ax = anchorX != null ? anchorX : tlScroll.clientWidth / 2;
+      const t = (tlScroll.scrollLeft + ax) / tlPps;
+      tlPps = pps;
+      tlRepositionAll();
+      tlSetScroll(Math.max(0, t * tlPps - ax));
+    }
+
+    function tlFit() {
+      const w = Math.max(50, tlScroll.clientWidth - 24);
+      tlPps = Math.max(2, Math.min(600, w / Math.max(1, tlDur)));
+      tlRepositionAll();
+      tlSetScroll(0);
+    }
+
+    function updateLineMetaText(li) {
+      const line = lines[li];
+      const meta = lyricsFlow.querySelector('.lyric-row[data-li="' + li + '"] .debug-line-meta');
+      if (meta) {
+        meta.textContent = 'Line ' + (li + 1) + '/' + lines.length + ' · ' +
+          line.words.length + ' words · ' + fmtRange(line.start, line.end);
+      }
+    }
+
+    function setWordTiming(li, wi, start, end, restore) {
+      const line = lines[li];
+      const w = line.words[wi];
+      w.start = round3(start);
+      w.end = round3(end);
+      w.source = restore ? restore.source : 'manual';
+      w.score = restore ? restore.score : 1;
+      const flat = flatByI.get(w.i);
+      if (flat) {
+        flat.start = w.start;
+        flat.end = w.end;
+        flat.source = w.source;
+        flat.score = w.score;
+      }
+      line.start = round3(line.words[0].start);
+      line.end = round3(Number(line.words[line.words.length - 1].end));
+      const span = lyricsFlow.querySelector('.w[data-li="' + li + '"][data-wi="' + wi + '"]');
+      if (span) {
+        span.dataset.start = w.start;
+        span.dataset.end = w.end;
+        const range = span.closest('.w-chip')?.querySelector('.w-range');
+        if (range) range.textContent = fmtRange(w.start, w.end);
+      }
+      updateLineMetaText(li);
+      const block = tlBlockFor(li, wi);
+      if (block) {
+        positionBlock(block);
+        block.classList.add('dirty');
+      }
+      tlDirty.add(w.i);
+      if (tlSel && tlSel.li === li && tlSel.wi === wi) syncSelInputs();
+      updateTlToolbar();
+    }
+
+    function pushUndo(entry) {
+      entry.t = performance.now();
+      entry.sig = entry.items.map((it) => tlKey(it.li, it.wi)).join(',');
+      const top = tlUndoStack[tlUndoStack.length - 1];
+      if (entry.kind === 'nudge' && top && top.kind === 'nudge' &&
+          top.sig === entry.sig && entry.t - top.t < 900) {
+        top.t = entry.t;
+      } else {
+        tlUndoStack.push(entry);
+        if (tlUndoStack.length > 300) tlUndoStack.shift();
+      }
+      updateTlToolbar();
+    }
+
+    function tlUndo() {
+      const en = tlUndoStack.pop();
+      if (!en) return;
+      en.items.forEach((it) => setWordTiming(it.li, it.wi, it.before.start, it.before.end, it.before));
+      tlSelKeys = new Set(en.items.map((it) => tlKey(it.li, it.wi)));
+      tlSel = { li: en.items[0].li, wi: en.items[0].wi };
+      updateSelUI();
+      updateTlToolbar();
+    }
+
+    function updateTlToolbar() {
+      tlUndoBtn.disabled = !tlUndoStack.length;
+      tlSaveBtn.disabled = !tlDirty.size || !!tlSaveBtn.dataset.busy;
+      tlSaveBtn.textContent = tlDirty.size ? 'Save (' + tlDirty.size + ')' : 'Save';
+    }
+
+    function setTlStatus(msg, sticky) {
+      tlStatus.textContent = msg || '';
+      clearTimeout(tlStatusTimer);
+      if (msg && !sticky) tlStatusTimer = setTimeout(() => { tlStatus.textContent = ''; }, 2500);
+    }
+
+    function applySelClass() {
+      tlWords.querySelectorAll('.tl-word.sel').forEach((el) => el.classList.remove('sel'));
+      tlSelList().forEach(({ li, wi }) => tlBlockFor(li, wi)?.classList.add('sel'));
+    }
+
+    function syncSelInputs() {
+      if (!tlSel) return;
+      const w = tlWordAt(tlSel.li, tlSel.wi);
+      if (!w) return;
+      tlSelWordEl.textContent = '“' + w.word + '”' + (tlSelKeys.size > 1 ? ' +' + (tlSelKeys.size - 1) : '');
+      if (document.activeElement !== tlSelStart) tlSelStart.value = Number(w.start).toFixed(3);
+      if (document.activeElement !== tlSelEnd) tlSelEnd.value = Number(w.end).toFixed(3);
+    }
+
+    function updateSelUI() {
+      applySelClass();
+      tlSelBox.hidden = !tlSel;
+      tlHint.hidden = !!tlSel;
+      if (tlSel) syncSelInputs();
+    }
+
+    function selectTlWord(li, wi, opts = {}) {
+      if (!tlWordAt(li, wi)) return;
+      const key = tlKey(li, wi);
+      if (opts.add) {
+        if (tlSelKeys.has(key)) {
+          tlSelKeys.delete(key);
+          if (tlSel && tlKey(tlSel.li, tlSel.wi) === key) {
+            const rest = tlSelList();
+            tlSel = rest.length ? rest[rest.length - 1] : null;
+          }
+        } else {
+          tlSelKeys.add(key);
+          tlSel = { li, wi };
+        }
+      } else if (opts.range && tlSel) {
+        const a = tlWordAt(tlSel.li, tlSel.wi).i;
+        const b = tlWordAt(li, wi).i;
+        const lo = Math.min(a, b);
+        const hi = Math.max(a, b);
+        lines.forEach((line, lli) => line.words.forEach((w, wwi) => {
+          if (w.i >= lo && w.i <= hi) tlSelKeys.add(tlKey(lli, wwi));
+        }));
+        tlSel = { li, wi };
+      } else {
+        tlSelKeys = new Set([key]);
+        tlSel = { li, wi };
+      }
+      updateSelUI();
+      if (tlSel && opts.reveal !== false) {
+        const x = tlWordAt(tlSel.li, tlSel.wi).start * tlPps;
+        if (x < tlScroll.scrollLeft + 40 || x > tlScroll.scrollLeft + tlScroll.clientWidth - 80) {
+          tlSetScroll(Math.max(0, x - tlScroll.clientWidth * 0.35));
+        }
+      }
+    }
+
+    function deselectTlWord() {
+      tlSel = null;
+      tlSelKeys.clear();
+      updateSelUI();
+    }
+
+    function commitSelInput() {
+      if (!tlSel) return;
+      const w = tlWordAt(tlSel.li, tlSel.wi);
+      if (!w) return;
+      let ns = parseFloat(tlSelStart.value);
+      let ne = parseFloat(tlSelEnd.value);
+      if (!isFinite(ns)) ns = w.start;
+      if (!isFinite(ne)) ne = Number(w.end);
+      ns = Math.max(0, ns);
+      ne = Math.max(ns + TL_MIN_DUR, Math.min(tlDur, ne));
+      ns = Math.min(ns, ne - TL_MIN_DUR);
+      if (round3(ns) === w.start && round3(ne) === Number(w.end)) { syncSelInputs(); return; }
+      pushUndo({ items: [{ li: tlSel.li, wi: tlSel.wi, before: { start: w.start, end: w.end, source: w.source, score: w.score } }] });
+      setWordTiming(tlSel.li, tlSel.wi, ns, ne);
+    }
+    tlSelStart.addEventListener('change', commitSelInput);
+    tlSelEnd.addEventListener('change', commitSelInput);
+
+    tlWords.addEventListener('pointerdown', (e) => {
+      const block = e.target.closest('.tl-word');
+      if (!block) return;
+      e.stopPropagation();
+      e.preventDefault();
+      const li = +block.dataset.li;
+      const wi = +block.dataset.wi;
+      const w = tlWordAt(li, wi);
+      if (!w) return;
+      const mode = e.target.classList.contains('tl-h-l') ? 'start'
+        : e.target.classList.contains('tl-h-r') ? 'end' : 'move';
+      const add = e.ctrlKey || e.metaKey;
+      const range = e.shiftKey;
+      if (!add && !range && !tlSelKeys.has(tlKey(li, wi))) {
+        selectTlWord(li, wi, { reveal: false });
+      }
+      const group = mode === 'move' && !add && !range && tlSelKeys.has(tlKey(li, wi))
+        ? tlSelList()
+        : [{ li, wi }];
+      tlDrag = {
+        li, wi, mode, add, range,
+        x0: e.clientX,
+        moved: false,
+        items: group.map(({ li: gli, wi: gwi }) => {
+          const gw = tlWordAt(gli, gwi);
+          return {
+            li: gli, wi: gwi,
+            start0: gw.start,
+            end0: Number(gw.end),
+            before: { start: gw.start, end: gw.end, source: gw.source, score: gw.score },
+          };
+        }),
+      };
+      tlWords.setPointerCapture(e.pointerId);
+    });
+
+    tlWords.addEventListener('pointermove', (e) => {
+      if (!tlDrag) return;
+      if (!tlDrag.moved && Math.abs(e.clientX - tlDrag.x0) < 3) return;
+      tlDrag.moved = true;
+      let dx = (e.clientX - tlDrag.x0) / tlPps;
+      const { mode, items } = tlDrag;
+      if (mode === 'move') {
+        items.forEach((it) => {
+          dx = Math.max(-it.start0, Math.min(tlDur - it.end0, dx));
+        });
+        items.forEach((it) => setWordTiming(it.li, it.wi, it.start0 + dx, it.end0 + dx));
+      } else if (mode === 'start') {
+        const it = items[0];
+        setWordTiming(it.li, it.wi, Math.max(0, Math.min(it.end0 - TL_MIN_DUR, it.start0 + dx)), it.end0);
+      } else {
+        const it = items[0];
+        setWordTiming(it.li, it.wi, it.start0, Math.max(it.start0 + TL_MIN_DUR, Math.min(tlDur, it.end0 + dx)));
+      }
+    });
+
+    function tlEndDrag() {
+      if (!tlDrag) return;
+      const d = tlDrag;
+      tlDrag = null;
+      if (d.moved) {
+        pushUndo({ items: d.items.map((it) => ({ li: it.li, wi: it.wi, before: it.before })) });
+        syncSelInputs();
+      } else if (d.add) {
+        selectTlWord(d.li, d.wi, { add: true, reveal: false });
+      } else if (d.range) {
+        selectTlWord(d.li, d.wi, { range: true, reveal: false });
+      } else {
+        selectTlWord(d.li, d.wi, { reveal: false });
+      }
+    }
+    tlWords.addEventListener('pointerup', tlEndDrag);
+    tlWords.addEventListener('pointercancel', tlEndDrag);
+
+    tlWords.addEventListener('dblclick', (e) => {
+      const block = e.target.closest('.tl-word');
+      if (!block) return;
+      const w = tlWordAt(+block.dataset.li, +block.dataset.wi);
+      if (!w) return;
+      audio.currentTime = Math.max(0, w.start - 0.15);
+      updateSeekUI();
+      if (audio.paused) audio.play().catch(() => {});
+    });
+
+    function tlSeekFromEvent(e) {
+      const rect = tlTrack.getBoundingClientRect();
+      const t = Math.max(0, Math.min(tlDur, (e.clientX - rect.left) / tlPps));
+      audio.currentTime = t;
+      updateSeekUI();
+    }
+    tlTrack.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.tl-word')) return;
+      tlScrub = true;
+      tlTrack.setPointerCapture(e.pointerId);
+      tlSeekFromEvent(e);
+    });
+    tlTrack.addEventListener('pointermove', (e) => { if (tlScrub) tlSeekFromEvent(e); });
+    tlTrack.addEventListener('pointerup', () => { tlScrub = false; });
+    tlTrack.addEventListener('pointercancel', () => { tlScrub = false; });
+
+    tlScroll.addEventListener('wheel', (e) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        const rect = tlScroll.getBoundingClientRect();
+        tlSetPps(tlPps * Math.exp(-e.deltaY * 0.01), e.clientX - rect.left);
+      } else if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        tlScroll.scrollLeft += e.deltaY;
+        tlUserScrollUntil = performance.now() + 1500;
+      }
+    }, { passive: false });
+
+    tlScroll.addEventListener('scroll', () => {
+      if (Math.abs(tlScroll.scrollLeft - tlProgScroll) > 1) {
+        tlUserScrollUntil = performance.now() + 1500;
+      }
+    });
+
+    document.getElementById('tlZoomIn').onclick = () => tlSetPps(tlPps * 1.5);
+    document.getElementById('tlZoomOut').onclick = () => tlSetPps(tlPps / 1.5);
+    document.getElementById('tlFitBtn').onclick = tlFit;
+    tlUndoBtn.onclick = tlUndo;
+    tlSaveBtn.onclick = () => tlSave();
+
+    async function loadWaveform(id) {
+      tlPeaks = null;
+      tlPeaksSong = id;
+      setTlStatus('Loading waveform…', true);
+      try {
+        const resp = await fetch('/api/songs/' + encodeURIComponent(id) + '/audio');
+        if (!resp.ok) throw new Error('audio fetch failed');
+        const buf = await resp.arrayBuffer();
+        const ac = new (window.AudioContext || window.webkitAudioContext)();
+        const decoded = await ac.decodeAudioData(buf);
+        ac.close();
+        if (tlPeaksSong !== id) return;
+        const ch = decoded.getChannelData(0);
+        const spp = Math.max(1, Math.floor(decoded.sampleRate / TL_PEAKS_PER_SEC));
+        const peaks = new Float32Array(Math.ceil(ch.length / spp));
+        for (let i = 0; i < peaks.length; i++) {
+          let m = 0;
+          const s0 = i * spp;
+          const s1 = Math.min(ch.length, s0 + spp);
+          for (let s = s0; s < s1; s += 2) {
+            const v = Math.abs(ch[s]);
+            if (v > m) m = v;
+          }
+          peaks[i] = m;
+        }
+        tlPeaks = peaks;
+        if (isFinite(decoded.duration) && decoded.duration > tlDur) {
+          tlDur = decoded.duration;
+          tlRepositionAll();
+        }
+        setTlStatus('');
+      } catch {
+        if (tlPeaksSong === id) setTlStatus('Waveform unavailable');
+      }
+    }
+
+    function drawTimeline() {
+      const cw = tlBody.clientWidth;
+      const chh = tlBody.clientHeight;
+      if (!cw || !chh) return;
+      const dpr = window.devicePixelRatio || 1;
+      if (tlCanvas.width !== Math.round(cw * dpr) || tlCanvas.height !== Math.round(chh * dpr)) {
+        tlCanvas.width = Math.round(cw * dpr);
+        tlCanvas.height = Math.round(chh * dpr);
+      }
+      const ctx = tlCtx;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cw, chh);
+      const sl = tlScroll.scrollLeft;
+
+      if (tlPeaks) {
+        const waveTop = TL_RULER_H;
+        const waveH = chh - waveTop;
+        const mid = waveTop + waveH / 2;
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.13)';
+        ctx.beginPath();
+        for (let x = 0; x < cw; x++) {
+          const t = (sl + x) / tlPps;
+          const p = tlPeaks[Math.floor(t * TL_PEAKS_PER_SEC)] || 0;
+          const h = Math.max(1, p * waveH * 0.92);
+          ctx.rect(x, mid - h / 2, 1, h);
+        }
+        ctx.fill();
+      }
+
+      const steps = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60];
+      const step = steps.find((s) => s * tlPps >= 64) || 60;
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.07)';
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+      ctx.font = '10px ui-monospace, Menlo, monospace';
+      ctx.beginPath();
+      const t1 = (sl + cw) / tlPps;
+      for (let k = Math.floor(sl / tlPps / step); k * step <= t1; k++) {
+        const t = k * step;
+        const x = Math.round(t * tlPps - sl) + 0.5;
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, chh);
+        ctx.fillText(step >= 1 ? fmtTime(t) : (Math.round(t * 100) / 100) + 's', x + 4, 11);
+      }
+      ctx.stroke();
+
+      const pt = audio.currentTime || 0;
+      tlPlayhead.style.left = (pt * tlPps) + 'px';
+      tlClock.textContent = fmtSec(pt);
+
+      const seeked = Math.abs(pt - tlLastPt) > 0.25;
+      tlLastPt = pt;
+      const interacting = tlDrag || tlScrub || performance.now() < tlUserScrollUntil;
+      if (!interacting && (!audio.paused || seeked)) {
+        const target = Math.max(0, pt * tlPps - cw / 2);
+        const gap = target - sl;
+        const next = (seeked || Math.abs(gap) > cw / 2) ? target : sl + gap * 0.3;
+        if (Math.abs(next - sl) > 0.5) tlSetScroll(next);
+      }
+
+      const pos = wordIndexAt(pt);
+      const key = pos.li + ':' + pos.wi;
+      if (tlActiveKey !== key) {
+        tlActiveKey = key;
+        tlActiveBlock?.classList.remove('now');
+        tlActiveBlock = tlBlockFor(pos.li, pos.wi);
+        tlActiveBlock?.classList.add('now');
+      }
+    }
+
+    async function tlSave() {
+      if (!currentId || !tlDirty.size || tlSaveBtn.dataset.busy) return;
+      tlSaveBtn.dataset.busy = '1';
+      updateTlToolbar();
+      setTlStatus('Saving…', true);
+      try {
+        const r = await fetch('/api/songs/' + encodeURIComponent(currentId) + '/timings', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ words }),
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data.error || 'Save failed');
+        const selIs = new Set(tlSelList().map(({ li, wi }) => tlWordAt(li, wi).i));
+        const primaryI = tlSel ? tlWordAt(tlSel.li, tlSel.wi)?.i : null;
+        lines = data.lines || lines;
+        words = data.words || words;
+        tlDirty.clear();
+        tlUndoStack = [];
+        buildFlow({ scrollToLine: lineAt(audio.currentTime || 0) });
+        buildTimelineBlocks();
+        tlSelKeys = new Set();
+        tlSel = null;
+        if (selIs.size) {
+          lines.forEach((line, li) => line.words.forEach((w, wi) => {
+            if (selIs.has(w.i)) {
+              tlSelKeys.add(tlKey(li, wi));
+              if (w.i === primaryI || !tlSel) tlSel = { li, wi };
+            }
+          }));
+        }
+        updateSelUI();
+        setTlStatus('Saved ✓');
+      } catch (err) {
+        setTlStatus(err.message || 'Save failed', true);
+      } finally {
+        delete tlSaveBtn.dataset.busy;
+        updateTlToolbar();
+      }
+    }
+
+    window.addEventListener('beforeunload', (e) => {
+      if (tlDirty.size) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
+    // ---------- end debug timing editor ----------
 
     let appearancePrefs = loadAppearance();
     let appearanceDebugOn = appearancePrefs.debug === true;
@@ -1739,6 +2486,70 @@
         closeSyncModal();
         closeSearchModal();
         closeSettingsModal();
+        if (tlIsOpen()) deselectTlWord();
+        return;
+      }
+      if (!tlIsOpen()) return;
+      const typing = e.target instanceof Element && e.target.matches('input, textarea');
+      if ((e.metaKey || e.ctrlKey) && e.key === 's') {
+        e.preventDefault();
+        tlSave();
+        return;
+      }
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key === 'z' && !typing) {
+        e.preventDefault();
+        tlUndo();
+        return;
+      }
+      if (typing) return;
+      if (e.key === ' ') {
+        e.preventDefault();
+        if (audio.paused) audio.play().catch(() => {});
+        else audio.pause();
+        return;
+      }
+      if (!tlSel) return;
+      const selItems = tlSelList();
+      if (!selItems.length) return;
+      const nudge = (apply) => {
+        pushUndo({
+          kind: 'nudge',
+          items: selItems.map(({ li, wi }) => {
+            const sw = tlWordAt(li, wi);
+            return { li, wi, before: { start: sw.start, end: sw.end, source: sw.source, score: sw.score } };
+          }),
+        });
+        apply();
+      };
+      const step = e.shiftKey ? 0.05 : 0.01;
+      if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        let d = (e.key === 'ArrowLeft' ? -1 : 1) * step;
+        if (e.altKey) {
+          nudge(() => selItems.forEach(({ li, wi }) => {
+            const sw = tlWordAt(li, wi);
+            const end = Number(sw.end);
+            setWordTiming(li, wi, Math.max(0, Math.min(end - TL_MIN_DUR, sw.start + d)), end);
+          }));
+        } else {
+          selItems.forEach(({ li, wi }) => {
+            const sw = tlWordAt(li, wi);
+            d = Math.max(-sw.start, Math.min(tlDur - Number(sw.end), d));
+          });
+          nudge(() => selItems.forEach(({ li, wi }) => {
+            const sw = tlWordAt(li, wi);
+            setWordTiming(li, wi, sw.start + d, Number(sw.end) + d);
+          }));
+        }
+        return;
+      }
+      if (e.code === 'Comma' || e.code === 'Period') {
+        e.preventDefault();
+        const d = (e.code === 'Comma' ? -1 : 1) * step;
+        nudge(() => selItems.forEach(({ li, wi }) => {
+          const sw = tlWordAt(li, wi);
+          setWordTiming(li, wi, sw.start, Math.max(sw.start + TL_MIN_DUR, Math.min(tlDur, Number(sw.end) + d)));
+        }));
       }
     });
 
@@ -1865,6 +2676,10 @@
         setPlayerVisible(false);
         empty.hidden = false;
         lyricsFlow.hidden = true;
+        tlSong = null;
+        tlDirty.clear();
+        tlUndoStack = [];
+        refreshTimelineVisibility();
       }
       await loadSongs();
       if (!currentId && songs.length) selectSong(songs[0].id);
@@ -1892,7 +2707,15 @@
         const span = e.target.closest('.w');
         if (!span) return;
         audio.currentTime = parseFloat(span.dataset.start) + 0.02;
-        if (audio.paused) audio.play().catch(() => {});
+        updateSeekUI();
+        if (tlIsOpen()) {
+          selectTlWord(parseInt(span.dataset.li, 10), parseInt(span.dataset.wi, 10), {
+            add: e.ctrlKey || e.metaKey,
+            range: e.shiftKey,
+          });
+        } else if (audio.paused) {
+          audio.play().catch(() => {});
+        }
       };
       const li = opts.scrollToLine != null ? opts.scrollToLine : 0;
       updateLineVisibility(li);
@@ -1990,15 +2813,18 @@
     }
 
     function tick() {
-      if (!lines.length) {
-        requestAnimationFrame(tick);
-        return;
-      }
-      applyLyricSync(audio.currentTime);
+      if (lines.length) applyLyricSync(audio.currentTime);
+      if (tlIsOpen()) drawTimeline();
       requestAnimationFrame(tick);
     }
 
     async function selectSong(id) {
+      if (id !== currentId && tlDirty.size) {
+        if (!confirm('Discard unsaved timing edits?')) return;
+        tlDirty.clear();
+        tlUndoStack = [];
+        updateTlToolbar();
+      }
       currentId = id;
       lastMainLine = -1;
       renderSongs();
@@ -2016,6 +2842,7 @@
       empty.hidden = true;
       lyricsFlow.hidden = false;
       buildFlow({ newSong: true });
+      refreshTimelineVisibility();
       app.classList.remove('collapsed');
     }
 
