@@ -262,7 +262,7 @@
     .song-item .song-main { flex: 1; min-width: 0; }
     .song-item:hover { background: var(--hover-bg); color: var(--text); }
     .song-item.active { background: var(--active-soft); color: var(--active); }
-    .song-del {
+    .song-action {
       flex-shrink: 0;
       width: 28px;
       height: 28px;
@@ -276,8 +276,9 @@
       opacity: 0;
       transition: opacity 0.12s, background 0.12s, color 0.12s;
     }
-    .song-item:hover .song-del,
-    .song-item:focus-within .song-del { opacity: 1; }
+    .song-item:hover .song-action,
+    .song-item:focus-within .song-action { opacity: 1; }
+    .song-edit:hover { background: var(--hover-bg); color: var(--text); }
     .song-del:hover { background: #3a2020; color: #ffb4b4; }
     .song-item .sub { font-size: 12px; color: var(--dim); margin-top: 3px; }
 
@@ -2587,12 +2588,14 @@
       document.querySelectorAll('.lookup-item[data-kind="youtube"]').forEach((el) => el.classList.remove('selected'));
       button.classList.add('selected');
       document.getElementById('url').value = decodeURIComponent(button.dataset.url);
+      const title = document.getElementById('title');
+      if (!title.value.trim()) title.value = decodeURIComponent(button.dataset.title || '');
     }
 
     function renderLookupResults(data) {
       const target = document.getElementById('lookupResults');
       const youtube = (data.youtube || []).map((item) =>
-        '<button class="lookup-item" data-kind="youtube" data-url="' + encodeURIComponent(item.url) + '">' +
+        '<button class="lookup-item" data-kind="youtube" data-url="' + encodeURIComponent(item.url) + '" data-title="' + encodeURIComponent(item.title) + '">' +
           '<strong>' + esc(item.title) + '</strong><span>' + esc(item.channel || 'YouTube') + (item.duration ? ' · ' + fmtTime(item.duration) : '') + '</span></button>'
       ).join('') || '<div class="modal-note">No YouTube matches</div>';
       target.innerHTML = '<div class="lookup-column"><div class="lookup-heading">YouTube results</div>' + youtube + '</div>';
@@ -2652,14 +2655,39 @@
               '<div>' + esc(s.title || s.id) + '</div>' +
               '<div class="sub">' + esc(s.preview || s.id) + '</div>' +
             '</div>' +
-            '<button type="button" class="song-del" title="Delete song">✕</button>';
+            '<button type="button" class="song-action song-edit" title="Edit song title" aria-label="Edit song title">✎</button>' +
+            '<button type="button" class="song-action song-del" title="Delete song" aria-label="Delete song">✕</button>';
           row.querySelector('.song-main').onclick = () => selectSong(s.id);
+          row.querySelector('.song-edit').onclick = (e) => {
+            e.stopPropagation();
+            editSongTitle(s);
+          };
           row.querySelector('.song-del').onclick = (e) => {
             e.stopPropagation();
             deleteSong(s.id);
           };
           songList.appendChild(row);
         });
+    }
+
+    async function editSongTitle(song) {
+      const title = prompt('Song title', song.title || song.id);
+      if (title === null) return;
+      const trimmed = title.trim();
+      if (!trimmed || trimmed === song.title) return;
+      const r = await fetch('/api/songs/' + encodeURIComponent(song.id), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: trimmed }),
+      });
+      const responseText = await r.text();
+      let data = {};
+      try { data = JSON.parse(responseText); } catch {}
+      if (!r.ok) {
+        alert(data.error || 'Could not update the title. Restart Lyric Sync and try again.');
+        return;
+      }
+      await loadSongs();
     }
 
     async function deleteSong(id) {

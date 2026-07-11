@@ -29,6 +29,53 @@ class SongPathSafetyTests(unittest.TestCase):
             self.assertEqual(client.delete("/api/songs/%2E%2E").status_code, 404)
 
 
+class SongTitleTests(unittest.TestCase):
+    def test_youtube_title_reads_video_metadata(self):
+        class FakeYDL:
+            def __init__(self, options):
+                self.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def extract_info(self, url, download=False):
+                self.request = (url, download)
+                return {"title": "  Video title  "}
+
+        with patch.dict(sys.modules, {"yt_dlp": type("YtDlp", (), {"YoutubeDL": FakeYDL})}):
+            self.assertEqual(app_module._youtube_title("https://youtu.be/example"), "Video title")
+
+    def test_edit_title_updates_meta_and_song_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "song"
+            d.mkdir()
+            (d / "meta.json").write_text(json.dumps({"id": "song", "title": "Old"}))
+            (d / "song.json").write_text(json.dumps({"meta": {"id": "song", "title": "Old"}, "lines": []}))
+            with (
+                patch.object(app_module, "song_dir", return_value=d),
+                app_module.app.test_client() as client,
+            ):
+                response = client.patch("/api/songs/song", json={"title": "New title"})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(json.loads((d / "meta.json").read_text())["title"], "New title")
+            self.assertEqual(json.loads((d / "song.json").read_text())["meta"]["title"], "New title")
+
+    def test_edit_title_rejects_blank_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "song"
+            d.mkdir()
+            with (
+                patch.object(app_module, "song_dir", return_value=d),
+                app_module.app.test_client() as client,
+            ):
+                response = client.patch("/api/songs/song", json={"title": "  "})
+        self.assertEqual(response.status_code, 400)
+
+
 class OpenSongsFolderTests(unittest.TestCase):
     def test_open_path_activates_finder_on_macos(self):
         with (

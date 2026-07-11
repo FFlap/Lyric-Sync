@@ -113,6 +113,24 @@ def _youtube_search(query: str) -> list[dict]:
     ]
 
 
+def _youtube_title(url: str) -> str:
+    """Read a video's title without downloading it."""
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise RuntimeError("yt-dlp is not installed") from exc
+    options = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        raise RuntimeError("Could not read the YouTube video title") from exc
+    title = str((info or {}).get("title") or "").strip()
+    if not title:
+        raise RuntimeError("The YouTube video does not have a title")
+    return title
+
+
 def _open_path(path: Path) -> None:
     """Open a local directory in the platform's file manager."""
     if os.name == "nt":
@@ -164,7 +182,7 @@ def _song_payload(song_id: str) -> dict:
 def _run_pipeline(url: str, lyrics: str, title: str | None, keep_adlibs: bool = False) -> None:
     lines, _ = parse_lyrics(lyrics, keep_adlibs=keep_adlibs)
     preview = lines[0] if lines else "Untitled"
-    song_title = (title or preview)[:80]
+    song_title = (title or _youtube_title(url))[:80]
     song_id = make_song_id(url, song_title)
     base = song_dir(song_id)
     if base.exists():
@@ -339,6 +357,33 @@ def api_delete_song(song_id: str):
     return jsonify({"ok": True})
 
 
+@app.route("/api/songs/<song_id>", methods=["PATCH"])
+def api_update_song(song_id: str):
+    try:
+        d = song_dir(song_id)
+    except ValueError:
+        return jsonify({"error": "not found"}), 404
+    if not d.is_dir():
+        return jsonify({"error": "not found"}), 404
+    title = str((request.get_json(force=True, silent=True) or {}).get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "Title cannot be empty"}), 400
+    if len(title) > 80:
+        return jsonify({"error": "Title must be 80 characters or fewer"}), 400
+
+    meta_file = d / "meta.json"
+    meta = json.loads(meta_file.read_text()) if meta_file.exists() else {"id": song_id}
+    meta["title"] = title
+    meta_file.write_text(json.dumps(meta, indent=2))
+
+    song_file = d / "song.json"
+    if song_file.exists():
+        song = json.loads(song_file.read_text())
+        song["meta"] = meta
+        song_file.write_text(json.dumps(song, indent=2))
+    return jsonify({"ok": True, "song": meta})
+
+
 @app.route("/api/songs/<song_id>")
 def api_song(song_id: str):
     try:
@@ -441,6 +486,13 @@ def api_sync():
 
     if not _job_lock.acquire(blocking=False):
         return jsonify({"ok": False, "error": "A sync is already running"}), 409
+
+    if title is None:
+        try:
+            title = _youtube_title(url)
+        except RuntimeError as exc:
+            _job_lock.release()
+            return jsonify({"ok": False, "error": str(exc)}), 502
 
     _write_status({"state": "queued", "progress": 0, "log": ["Queued…"], "error": None})
 
